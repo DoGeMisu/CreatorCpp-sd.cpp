@@ -4,7 +4,7 @@
 #include <cmath>
 #include <vector>
 
-#include "rng.h"
+#include "rng.hpp"
 
 // RNG imitiating torch cuda randn on CPU.
 // Port from: https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/5ef669de080814067961f28357256e8fe27544f4/modules/rng_philox.py
