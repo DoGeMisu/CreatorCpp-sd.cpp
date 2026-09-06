@@ -7,6 +7,16 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "core/ggml_extend.hpp"
 #include "core/ggml_graph_cut.h"
 #include "core/layer_split_partition.h"
@@ -236,6 +246,9 @@ public:
     float ip_adapter_strength = 1.0f;
     std::vector<std::shared_ptr<GenerationExtension>> generation_extensions;
     std::vector<std::shared_ptr<LoraModel>> runtime_lora_models;
+    // LoRA 去重缓存：记录上次 at_runtime 加载的 LoRA 签名，若相同则复用 adapter，避免每次生成重复解析文件
+    std::string cached_lora_signature;
+    bool runtime_loras_applied = false;
     bool apply_lora_immediately = false;
     bool animatediff_loaded     = false;
     int animatediff_num_frames  = 0;
@@ -251,12 +264,39 @@ public:
     std::string split_mode_spec;
     bool auto_fit_enabled = false;
 
+    // --- Two-phase video generation support (memory-light mode) ---
+    int  encode_encoder_type = 0;  // 0=LTX2, 1=Wan, 2=HunyuanVideo, 3=MiniMax-H3
+    bool encode_only_mode = false;
+    std::string internal_encoder_extra_path;  // LTX embeddings connectors (may be empty for other models)
+    bool use_precomputed_embeddings = false;
+    std::string precomputed_cond_embedding_path;
+    std::string precomputed_uncond_embedding_path;
+    // Audio VAE path from SD_AUDIO_VAE_PATH environment variable (zero ABI change).
+    std::string env_audio_vae_path;
+
+    // --- Three-phase video generation: decode-only (VAE) mode ---
+    // When true, init() loads ONLY the VAE (no diffusion model, no TE).
+    // Used by new_video_vae_ctx() for Phase 3 latent decoding.
+    bool decode_only_mode = false;
+
+    // --- Three-phase video generation: diffusion-only mode ---
+    // When true, init() loads ONLY the diffusion model (no VAE, no TE).
+    // Used by new_video_diffusion_ctx() for Phase 2 sampling.
+    // generate_video() will skip VAE decode and cache the latent.
+    bool diffusion_only_mode = false;
+    // Cached final latent from generate_video() for sd_save_video_latent()
+    sd::Tensor<float> cached_final_latent;
+    int  cached_audio_length = 0;
+
     bool diffusion_conv_direct = false;
 
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
 
     size_t control_net_params_mem_size = 0;
+
+    // ControlNet wtype override for hot-swap loading (GGML_TYPE_COUNT = no override)
+    ggml_type control_net_wtype = GGML_TYPE_COUNT;
 
     std::shared_ptr<ModelManager> model_manager;
 
@@ -583,6 +623,13 @@ public:
         }
         shared_loader.convert_tensors_name();
 
+        // Apply wtype override for ControlNet tensors (if set via sd_ctx_set_control_net_wtype)
+        if (control_net_wtype != GGML_TYPE_COUNT) {
+            LOG_INFO("sd_ctx_load_control_net: applying wtype override: %s",
+                     ggml_type_name(control_net_wtype));
+            shared_loader.set_wtype_override(control_net_wtype);
+        }
+
         if (!ensure_backend_pair(SDBackendModule::CONTROL_NET)) {
             LOG_ERROR("sd_ctx_load_control_net: control_net backend unavailable");
             return false;
@@ -727,14 +774,7 @@ public:
             }
         }
 
-        if (strlen(SAFE_STR(sd_ctx_params->uncond_diffusion_model_path)) > 0) {
-            LOG_INFO("loading unconditional diffusion model from '%s'", sd_ctx_params->uncond_diffusion_model_path);
-            if (!model_loader.init_from_file(sd_ctx_params->uncond_diffusion_model_path, "model.diffusion_model.uncond.")) {
-                LOG_WARN("loading unconditional diffusion model from '%s' failed", sd_ctx_params->uncond_diffusion_model_path);
-            }
-        }
-
-        if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
+if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
             LOG_INFO("loading clip_l from '%s'", sd_ctx_params->clip_l_path);
             if (!model_loader.init_from_file(sd_ctx_params->clip_l_path, "clip_l.")) {
                 LOG_WARN("loading clip_l from '%s' failed", sd_ctx_params->clip_l_path);
@@ -762,18 +802,20 @@ public:
             }
         }
 
-        if (strlen(SAFE_STR(sd_ctx_params->pulid_weights_path)) > 0) {
-            LOG_INFO("loading PuLID weights from '%s'", sd_ctx_params->pulid_weights_path);
-            if (!model_loader.init_from_file(sd_ctx_params->pulid_weights_path,
-                                             "model.diffusion_model.")) {
-                LOG_WARN("loading PuLID weights from '%s' failed", sd_ctx_params->pulid_weights_path);
-            }
-        }
-
         if (strlen(SAFE_STR(sd_ctx_params->llm_path)) > 0) {
             LOG_INFO("loading llm from '%s'", sd_ctx_params->llm_path);
             if (!model_loader.init_from_file(sd_ctx_params->llm_path, "text_encoders.llm.")) {
                 LOG_WARN("loading llm from '%s' failed", sd_ctx_params->llm_path);
+            }
+        }
+
+        // Two-phase video generation: in encode-only mode, also load the
+        // encoder extra weights (LTX-2.3 embeddings connectors,
+        // text_embedding_projection.*) used by the conditioner.
+        if (encode_only_mode && !internal_encoder_extra_path.empty()) {
+            LOG_INFO("loading encoder extra weights from '%s'", internal_encoder_extra_path.c_str());
+            if (!model_loader.init_from_file(internal_encoder_extra_path.c_str())) {
+                LOG_WARN("loading encoder extra weights from '%s' failed", internal_encoder_extra_path.c_str());
             }
         }
 
@@ -801,29 +843,13 @@ public:
             }
         }
 
-        if (strlen(SAFE_STR(sd_ctx_params->embeddings_connectors_path)) > 0) {
-            LOG_INFO("loading embeddings connectors from '%s'", sd_ctx_params->embeddings_connectors_path);
-            if (!model_loader.init_from_file(sd_ctx_params->embeddings_connectors_path)) {
-                LOG_WARN("loading embeddings connectors from '%s' failed", sd_ctx_params->embeddings_connectors_path);
-            }
-        }
-
-        if (strlen(SAFE_STR(sd_ctx_params->audio_vae_path)) > 0) {
-            LOG_INFO("loading audio VAE from '%s'", sd_ctx_params->audio_vae_path);
-            if (!model_loader.init_from_file(sd_ctx_params->audio_vae_path)) {
-                LOG_WARN("loading audio VAE weights from '%s' failed", sd_ctx_params->audio_vae_path);
+        // Audio VAE (LTX-2.3): loaded from SD_AUDIO_VAE_PATH env (zero ABI change).
+        if (!env_audio_vae_path.empty()) {
+            LOG_INFO("loading audio vae from '%s'", env_audio_vae_path.c_str());
+            if (!model_loader.init_from_file(env_audio_vae_path.c_str())) {
+                LOG_WARN("loading audio vae from '%s' failed", env_audio_vae_path.c_str());
             } else {
                 use_audio_vae = true;
-            }
-        }
-
-        if (strlen(SAFE_STR(sd_ctx_params->motion_module_path)) > 0) {
-            LOG_INFO("loading motion module (AnimateDiff) from '%s'", sd_ctx_params->motion_module_path);
-            if (!model_loader.init_from_file(sd_ctx_params->motion_module_path,
-                                             "model.diffusion_model.motion_module.")) {
-                LOG_WARN("loading motion module from '%s' failed", sd_ctx_params->motion_module_path);
-            } else {
-                animatediff_loaded = true;
             }
         }
 
@@ -836,12 +862,7 @@ public:
             }
         }
 
-        if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0) {
-            if (!model_loader.init_from_file(sd_ctx_params->ip_adapter_path)) {
-                LOG_ERROR("init ip-adapter model loader from file failed: '%s'", sd_ctx_params->ip_adapter_path);
-                return false;
-            }
-        }
+        // ip_adapter_path removed for ABI compat �?always disabled
 
         model_loader.convert_tensors_name();
 
@@ -857,26 +878,127 @@ public:
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads           = sd_ctx_params->n_threads;
         enable_mmap         = sd_ctx_params->enable_mmap;
-        stream_layers       = sd_ctx_params->stream_layers;
-        eager_load          = sd_ctx_params->eager_load;
-        backend_spec        = SAFE_STR(sd_ctx_params->backend);
-        params_backend_spec = SAFE_STR(sd_ctx_params->params_backend);
-        split_mode_spec     = SAFE_STR(sd_ctx_params->split_mode);
-        auto_fit_enabled    = sd_ctx_params->auto_fit;
+        stream_layers       = false;  // hardcoded: stream_layers removed from sd_ctx_params_t for ABI compat
+        eager_load          = true;   // eager load: load all weights into VRAM at init
+        // backend removed from sd_ctx_params_t for ABI compat.
+        // Allow runtime override via SD_BACKEND env var (e.g. "CPU", "CUDA0", "Vulkan0").
+        // When unset, falls back to "" (auto-select best device, typically CUDA).
+        // Use Win32 GetEnvironmentVariableA instead of getenv() to avoid CRT
+        // isolation between EXE and DLL on Windows.
+        {
+            char env_buf[256] = {0};
+            DWORD len = 0;
+#ifdef _WIN32
+            len = GetEnvironmentVariableA("SD_BACKEND", env_buf, sizeof(env_buf));
+#else
+            const char* e = getenv("SD_BACKEND");
+            if (e) { strncpy(env_buf, e, sizeof(env_buf)-1); len = strlen(env_buf); }
+#endif
+            backend_spec = (len > 0) ? std::string(env_buf) : "";
+            LOG_INFO("SD_BACKEND env: \"%s\"", backend_spec.c_str());
+        }
+        params_backend_spec = "";     // hardcoded: params_backend removed from sd_ctx_params_t for ABI compat
+        {
+            // Allow runtime override via SD_PARAMS_BACKEND env var
+            // (e.g. "te=cpu" to keep text encoder weights in system RAM).
+            char env_buf[256] = {0};
+            DWORD len = 0;
+#ifdef _WIN32
+            len = GetEnvironmentVariableA("SD_PARAMS_BACKEND", env_buf, sizeof(env_buf));
+#else
+            const char* e = getenv("SD_PARAMS_BACKEND");
+            if (e) { strncpy(env_buf, e, sizeof(env_buf)-1); len = strlen(env_buf); }
+#endif
+            LOG_INFO("SD_PARAMS_BACKEND env raw: \"%s\"", len > 0 ? env_buf : "(null)");
+            if (len > 0) {
+                params_backend_spec = std::string(env_buf);
+                LOG_INFO("params_backend from SD_PARAMS_BACKEND env: \"%s\"", params_backend_spec.c_str());
+            }
+        }
+        split_mode_spec     = "";     // hardcoded: split_mode removed from sd_ctx_params_t for ABI compat
+        auto_fit_enabled    = false;  // hardcoded: auto_fit removed from sd_ctx_params_t for ABI compat
         max_vram_assignment.reset(0.f);
         {
+            // Detect video mode: when SD_VIDEO_MODE=1, enable dynamic VRAM detection
+            // and auto_fit regardless of params_backend_spec. This allows the video
+            // pipeline to intelligently place weights on GPU/CPU based on actual
+            // available VRAM, instead of hardcoding all weights to CPU.
+            bool video_mode = false;
+            {
+                char vm_buf[16] = {0};
+                DWORD vm_len = 0;
+#ifdef _WIN32
+                vm_len = GetEnvironmentVariableA("SD_VIDEO_MODE", vm_buf, sizeof(vm_buf));
+#else
+                const char* vm_e = getenv("SD_VIDEO_MODE");
+                if (vm_e) { strncpy(vm_buf, vm_e, sizeof(vm_buf)-1); vm_len = strlen(vm_buf); }
+#endif
+                video_mode = (vm_len > 0 && vm_buf[0] == '1');
+            }
+            if (video_mode) {
+                LOG_INFO("SD_VIDEO_MODE=1: video mode enabled, overriding params_backend for dynamic VRAM placement");
+                // Clear params_backend_spec so auto_fit can make module-level decisions
+                if (!params_backend_spec.empty()) {
+                    LOG_INFO("SD_VIDEO_MODE: clearing params_backend_spec \"%s\" for auto_fit", params_backend_spec.c_str());
+                    params_backend_spec = "";
+                }
+                // Enable stream_layers in video mode: allows annotate_residency
+                // to mark graph segments as RESIDENT (kept in VRAM across sampling
+                // steps) instead of defaulting to STREAMED (free+restage every step).
+                // This is the key optimization for reducing PCIe transfer in the
+                // diffusion sampling loop when the model is partially offloaded to RAM.
+                // stream_layers is only effective when params_backend is cpu (checked below).
+                stream_layers = true;
+                LOG_INFO("SD_VIDEO_MODE: stream_layers enabled for sampling loop optimization");
+            }
+            // max_vram is now a float (GiB), 0=disabled, -1=auto
+            // Convert to the string format that MaxVramAssignment::parse() expects
             std::string error;
-            if (!max_vram_assignment.parse(SAFE_STR(sd_ctx_params->max_vram), &error)) {
-                LOG_ERROR("%s", error.c_str());
-                return false;
+            float mv = sd_ctx_params->max_vram;
+            if (video_mode) {
+                // Video mode: use -1 (auto-detect) to let auto_fit query actual free VRAM
+                mv = -1.f;
+            }
+            if (mv != 0.f && (params_backend_spec.empty() || video_mode)) {
+                // Only use auto_fit when params_backend is not manually specified.
+                // Manual params_backend (via SD_PARAMS_BACKEND) takes precedence
+                // because auto_fit's time_share/disk mode has known issues with
+                // weight quantization conversion on some architectures.
+                // Video mode overrides this restriction to enable dynamic placement.
+                std::string max_vram_str = std::to_string(mv);
+                if (!max_vram_assignment.parse(max_vram_str, &error)) {
+                    LOG_ERROR("%s", error.c_str());
+                    return false;
+                }
+                auto_fit_enabled = true;
+                if (video_mode) {
+                    LOG_INFO("SD_VIDEO_MODE: auto_fit enabled with max_vram=-1 (auto-detect free VRAM)");
+                } else {
+                    LOG_INFO("max_vram=%.2f GiB specified, auto-enabling auto-fit for CPU offload", mv);
+                }
             }
         }
 
-        std::string rpc_servers_spec = SAFE_STR(sd_ctx_params->rpc_servers);
-        add_rpc_devices(rpc_servers_spec);
+        // rpc_servers removed from sd_ctx_params_t for ABI compat �?no RPC devices
 
         bool use_tae         = false;
-        bool use_audio_vae   = false;
+        // Audio VAE path: read from SD_AUDIO_VAE_PATH env (zero ABI change).
+        env_audio_vae_path.clear();
+        {
+            char env_buf[1024] = {0};
+            DWORD len = 0;
+#ifdef _WIN32
+            len = GetEnvironmentVariableA("SD_AUDIO_VAE_PATH", env_buf, sizeof(env_buf));
+#else
+            const char* e = getenv("SD_AUDIO_VAE_PATH");
+            if (e) { strncpy(env_buf, e, sizeof(env_buf)-1); len = strlen(env_buf); }
+#endif
+            if (len > 0) {
+                env_audio_vae_path = std::string(env_buf, len);
+                LOG_INFO("SD_AUDIO_VAE_PATH env: \"%s\"", env_audio_vae_path.c_str());
+            }
+        }
+        bool use_audio_vae   = !env_audio_vae_path.empty();
         bool use_control_net = false;
 
         rng = get_rng(sd_ctx_params->rng_type);
@@ -898,6 +1020,27 @@ public:
         }
 
         version = model_loader.get_sd_version();
+        if (encode_only_mode) {
+            // Force the version to match the requested encoder architecture.
+            switch (encode_encoder_type) {
+                case 1: version = VERSION_WAN2;          break;  // Wan2.x (T5 XXL)
+                case 2: version = VERSION_HUNYUAN_VIDEO; break;  // HunyuanVideo (MLLM)
+                case 3: version = VERSION_MINIMAX_H3;    break;  // MiniMax-H3 (LLM)
+                default: version = VERSION_LTXAV;        break;  // LTX-2.3 (Gemma LLM)
+            }
+            LOG_INFO("encode-only mode: version forced to %s (encoder type %d)",
+                     model_version_to_str[version], encode_encoder_type);
+        }
+        if (decode_only_mode) {
+            // VAE-only context: force version to LTXAV so that LTXVideoVAE
+            // and LTXAudioVAE are constructed. The VAE file must be the
+            // LTX-2.3 video VAE safetensors.
+            version = VERSION_LTXAV;
+            LOG_INFO("decode-only mode: version forced to %s", model_version_to_str[version]);
+        }
+        if (diffusion_only_mode) {
+            LOG_INFO("diffusion-only mode: diffusion model only (no VAE, no TE)");
+        }
         if (version == VERSION_COUNT) {
             LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
             return false;
@@ -917,6 +1060,50 @@ public:
 
         if (!init_backend()) {
             return false;
+        }
+        // Diagnostic: log runtime/params backend assignment for each module
+        {
+            LOG_INFO("=== Backend Assignment Diagnostics ===");
+            LOG_INFO("eager_load=%s, auto_fit_enabled=%s, enable_mmap=%s",
+                     eager_load ? "true" : "false",
+                     auto_fit_enabled ? "true" : "false",
+                     enable_mmap ? "true" : "false");
+            SDBackendModule mods[] = {
+                SDBackendModule::DIFFUSION, SDBackendModule::TE,
+                SDBackendModule::CLIP_VISION, SDBackendModule::VAE,
+                SDBackendModule::CONTROL_NET, SDBackendModule::PHOTOMAKER,
+                SDBackendModule::UPSCALER, SDBackendModule::DETECTOR
+            };
+            for (SDBackendModule mod : mods) {
+                ggml_backend_t rt = backend_manager.runtime_backend(mod);
+                ggml_backend_t pb = backend_manager.params_backend(mod);
+                LOG_INFO("  module[%s]: runtime=%s, params=%s, rt_is_cpu=%s, pb_is_cpu=%s",
+                         sd_backend_module_name(mod),
+                         rt ? "ok" : "null",
+                         pb ? "ok" : "null",
+                         rt ? (sd_backend_is_cpu(rt) ? "true" : "false") : "n/a",
+                         pb ? (sd_backend_is_cpu(pb) ? "true" : "false") : "n/a");
+            }
+            LOG_INFO("=== End Backend Diagnostics ===");
+            // Video mode: log actual VRAM status for each non-CPU runtime backend
+            for (SDBackendModule mod : mods) {
+                ggml_backend_t rt = backend_manager.runtime_backend(mod);
+                if (rt != nullptr && !sd_backend_is_cpu(rt)) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(rt);
+                    if (dev != nullptr) {
+                        size_t free_vram = 0, total_vram = 0;
+                        ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+                        LOG_INFO("  VRAM [%s]: free=%.2f GiB, total=%.2f GiB",
+                                 sd_backend_module_name(mod),
+                                 free_vram / (1024.0 * 1024.0 * 1024.0),
+                                 total_vram / (1024.0 * 1024.0 * 1024.0));
+                    }
+                }
+            }
+            LOG_INFO("[LTX][Stage] Backend initialized: stream_layers=%s, auto_fit=%s, eager_load=%s",
+                     stream_layers ? "true" : "false",
+                     auto_fit_enabled ? "true" : "false",
+                     eager_load ? "true" : "false");
         }
         {
             std::string error;
@@ -1093,7 +1280,7 @@ public:
                                                                         1,
                                                                         false,
                                                                         model_manager,
-                                                                        sd_ctx_params->model_args);
+                                                                        nullptr  /* model_args removed for ABI compat */);
                 } else if (version == VERSION_OVIS_IMAGE) {
                     cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                      tensor_storage_map,
@@ -1111,7 +1298,7 @@ public:
                                                                      "model.diffusion_model",
                                                                      version,
                                                                      model_manager,
-                                                                     sd_ctx_params->model_args);
+                                                                     nullptr  /* model_args removed for ABI compat */);
             } else if (sd_version_is_flux2(version) || sd_version_is_sefi_image(version)) {
                 bool is_chroma   = false;
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
@@ -1125,17 +1312,34 @@ public:
                                                                      "model.diffusion_model",
                                                                      version,
                                                                      model_manager,
-                                                                     sd_ctx_params->model_args);
+                                                                     nullptr  /* model_args removed for ABI compat */);
             } else if (sd_version_is_ltxav(version)) {
-                cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
-                                                                   tensor_storage_map,
-                                                                   "text_encoders.llm",
-                                                                   "text_embedding_projection",
-                                                                   model_manager);
-                diffusion_model  = std::make_shared<LTXV::LTXAVRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                      tensor_storage_map,
-                                                                      "model.diffusion_model",
-                                                                      model_manager);
+                // In two-phase mode the generation context is created without
+                // the text encoder. Detect that by checking whether the loaded
+                // tensors contain any text_encoders.llm.* weights.
+                bool has_llm_tensors = false;
+                for (const auto& [name, _] : tensor_storage_map) {
+                    if (name.rfind("text_encoders.llm.", 0) == 0) {
+                        has_llm_tensors = true;
+                        break;
+                    }
+                }
+                if (has_llm_tensors) {
+                    cond_stage_model = std::make_shared<LTXAVEmbedder>(backend_for(SDBackendModule::TE),
+                                                                       tensor_storage_map,
+                                                                       "text_encoders.llm",
+                                                                       "text_embedding_projection",
+                                                                       model_manager);
+                } else {
+                    LOG_INFO("LTXAV: no text_encoders.llm tensors found; text encoder skipped "
+                             "(use sd_encode_video_prompt + sd_ctx_set_precomputed_embeddings for two-phase generation)");
+                }
+                if (!encode_only_mode) {
+                    diffusion_model = std::make_shared<LTXV::LTXAVRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                          tensor_storage_map,
+                                                                          "model.diffusion_model",
+                                                                          model_manager);
+                }
             } else if (sd_version_is_minimax_h3(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1143,10 +1347,12 @@ public:
                                                                  "",
                                                                  true,
                                                                  model_manager);
-                diffusion_model  = std::make_shared<MiniMaxH3::MiniMaxH3Runner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                               tensor_storage_map,
-                                                                               "model.diffusion_model",
-                                                                               model_manager);
+                if (!encode_only_mode) {
+                    diffusion_model = std::make_shared<MiniMaxH3::MiniMaxH3Runner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                   tensor_storage_map,
+                                                                                   "model.diffusion_model",
+                                                                                   model_manager);
+                }
             } else if (sd_version_is_hunyuan_video(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1154,11 +1360,13 @@ public:
                                                                  "",
                                                                  false,
                                                                  model_manager);
-                diffusion_model  = std::make_shared<Hunyuan::HunyuanVideoRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                                tensor_storage_map,
-                                                                                "model.diffusion_model",
-                                                                                version,
-                                                                                model_manager);
+                if (!encode_only_mode) {
+                    diffusion_model = std::make_shared<Hunyuan::HunyuanVideoRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                    tensor_storage_map,
+                                                                                    "model.diffusion_model",
+                                                                                    version,
+                                                                                    model_manager);
+                }
             } else if (sd_version_is_wan(version)) {
                 cond_stage_model = std::make_shared<T5CLIPEmbedder>(backend_for(SDBackendModule::TE),
                                                                     tensor_storage_map,
@@ -1166,32 +1374,34 @@ public:
                                                                     0,
                                                                     true,
                                                                     model_manager);
-                diffusion_model  = std::make_shared<WAN::WanRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                   tensor_storage_map,
-                                                                   "model.diffusion_model",
-                                                                   version,
-                                                                   model_manager);
-                if (strlen(SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path)) > 0) {
-                    high_noise_diffusion_model = std::make_shared<WAN::WanRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                                  tensor_storage_map,
-                                                                                  "model.high_noise_diffusion_model",
-                                                                                  version,
-                                                                                  model_manager);
-                }
-                if (diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
-                    diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
-                    diffusion_model->get_desc() == "Wan2.1-I2V-1.3B") {
-                    if (!ensure_backend_pair(SDBackendModule::CLIP_VISION)) {
-                        return false;
+                if (!encode_only_mode) {
+                    diffusion_model  = std::make_shared<WAN::WanRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                       tensor_storage_map,
+                                                                       "model.diffusion_model",
+                                                                       version,
+                                                                       model_manager);
+                    if (strlen(SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path)) > 0) {
+                        high_noise_diffusion_model = std::make_shared<WAN::WanRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                                      tensor_storage_map,
+                                                                                      "model.high_noise_diffusion_model",
+                                                                                      version,
+                                                                                      model_manager);
                     }
-                    clip_vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend_for(SDBackendModule::CLIP_VISION),
-                                                                             tensor_storage_map,
-                                                                             model_manager);
-                    clip_vision->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::CLIP_VISION));
-                    if (!register_runner_params("CLIP vision",
-                                                clip_vision,
-                                                SDBackendModule::CLIP_VISION)) {
-                        return false;
+                    if (diffusion_model->get_desc() == "Wan2.1-I2V-14B" ||
+                        diffusion_model->get_desc() == "Wan2.1-FLF2V-14B" ||
+                        diffusion_model->get_desc() == "Wan2.1-I2V-1.3B") {
+                        if (!ensure_backend_pair(SDBackendModule::CLIP_VISION)) {
+                            return false;
+                        }
+                        clip_vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend_for(SDBackendModule::CLIP_VISION),
+                                                                                 tensor_storage_map,
+                                                                                 model_manager);
+                        clip_vision->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::CLIP_VISION));
+                        if (!register_runner_params("CLIP vision",
+                                                    clip_vision,
+                                                    SDBackendModule::CLIP_VISION)) {
+                            return false;
+                        }
                     }
                 }
             } else if (sd_version_is_lingbot_video(version)) {
@@ -1212,7 +1422,7 @@ public:
                                                                                      tensor_storage_map,
                                                                                      "model.diffusion_model",
                                                                                      model_manager,
-                                                                                     sd_ctx_params->model_args);
+                                                                                     nullptr  /* model_args removed for ABI compat */);
             } else if (sd_version_is_qwen_image(version)) {
                 bool enable_vision = version != VERSION_QWEN_IMAGE_LAYERED;
                 cond_stage_model   = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
@@ -1226,7 +1436,7 @@ public:
                                                                           "model.diffusion_model",
                                                                           version,
                                                                           model_manager,
-                                                                          sd_ctx_params->model_args);
+                                                                          nullptr  /* model_args removed for ABI compat */);
             } else if (sd_version_is_mage_flow(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -1250,7 +1460,7 @@ public:
                                                                      "model.diffusion_model",
                                                                      version,
                                                                      model_manager,
-                                                                     sd_ctx_params->model_args);
+                                                                     nullptr  /* model_args removed for ABI compat */);
             } else if (version == VERSION_HIDREAM_O1) {
                 cond_stage_model = std::make_shared<HiDreamO1::HiDreamO1Conditioner>(backend_for(SDBackendModule::TE),
                                                                                      tensor_storage_map,
@@ -1342,12 +1552,155 @@ public:
                 }
             }
 
-            cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::TE));
-            if (!register_runner_params("Conditioner model",
-                                        cond_stage_model,
-                                        SDBackendModule::TE,
-                                        &text_encoder_params_mem_size)) {
-                return false;
+            if (cond_stage_model) {
+                cond_stage_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::TE));
+                LOG_INFO("encode-only: registering conditioner params...");
+                if (!register_runner_params("Conditioner model",
+                                            cond_stage_model,
+                                            SDBackendModule::TE,
+                                            &text_encoder_params_mem_size)) {
+                    LOG_ERROR("encode-only: register_runner_params for conditioner FAILED");
+                    return false;
+                }
+                LOG_INFO("encode-only: conditioner params registered (mem_size=%zu)", text_encoder_params_mem_size);
+            }
+
+            // ---- Two-phase video generation: encode-only early exit ----
+            // Only the text encoder is registered. Skip the diffusion model,
+            // VAE, extensions and denoiser setup entirely.
+            if (encode_only_mode) {
+                if (sd_ctx_params->flash_attn) {
+                    LOG_INFO("Using flash attention (encode-only)");
+                    cond_stage_model->set_flash_attention_enabled(true);
+                }
+                // Defensive check: ensure text-encoder weights were loaded.
+                // The GGUF loader (init_from_gguf_file) automatically prepends
+                // the prefix (e.g. "text_encoders.llm.") to all tensor names,
+                // and convert_tensors_name() maps llama.cpp names to HF names
+                // (token_embd. -> model.embed_tokens., blk. -> model.layers., etc.).
+                // So both QAT and standard Gemma GGUF files should work.
+                {
+                    bool has_llm_weights = false;
+                    bool has_te_weights  = false;
+                    int  llm_tensor_count = 0;
+                    int  te_tensor_count  = 0;
+                    for (const auto& [name, _] : tensor_storage_map) {
+                        if (name.rfind("text_encoders.llm.", 0) == 0) {
+                            has_llm_weights = true;
+                            llm_tensor_count++;
+                        }
+                        if (name.rfind("text_encoders.t5xxl.", 0) == 0) {
+                            has_te_weights = true;
+                            te_tensor_count++;
+                        }
+                    }
+                    LOG_INFO("encode-only: llm tensors=%d, t5xxl tensors=%d", llm_tensor_count, te_tensor_count);
+                    // Print a few sample tensor names for debugging
+                    int sample_count = 0;
+                    for (const auto& [name, _] : tensor_storage_map) {
+                        if (name.rfind("text_encoders.llm.", 0) == 0) {
+                            LOG_INFO("encode-only: sample llm tensor: %s", name.c_str());
+                            if (++sample_count >= 5) break;
+                        }
+                    }
+                    if (!has_llm_weights && !has_te_weights) {
+                        LOG_ERROR(
+                            "encode-only: no text-encoder weights loaded from '%s'. "
+                            "Check that the text encoder model path is correct.",
+                            SAFE_STR(sd_ctx_params->llm_path));
+                        return false;
+                    }
+                }
+                // 防御性检查：确保文本编码器权重确实加载了（张量名带预期前缀）。
+                // 用户误用普通 Gemma GGUF（llama.cpp 命名，无 text_encoders.llm. 前缀）
+                // 会导致 LLMRunner 以空权重运行 → 推理除零崩溃 (0xC0000094)。
+                {
+                    bool has_llm_weights = false;
+                    bool has_te_weights  = false;
+                    for (const auto& [name, _] : tensor_storage_map) {
+                        if (name.rfind("text_encoders.llm.", 0) == 0) has_llm_weights = true;
+                        if (name.rfind("text_encoders.t5xxl.", 0) == 0) has_te_weights = true;
+                    }
+                    if (!has_llm_weights && !has_te_weights) {
+                        LOG_ERROR(
+                            "encode-only: no text-encoder weights loaded from '%s'. "
+                            "For LTX-2.3 the Gemma GGUF must be the QAT build "
+                            "(gemma-3-12b-it-qat-UD-*.gguf from unsloth/LTX-2.3-GGUF), "
+                            "whose tensors use the 'text_encoders.llm.' prefix. "
+                            "The standard gemma-3-12b-it-*.gguf (llama.cpp naming) will NOT work.",
+                            SAFE_STR(sd_ctx_params->llm_path));
+                        return false;
+                    }
+                }
+                // The LLM GGUF may carry lm_head / other non-encoder tensors
+                // that are not consumed by the conditioner.
+                model_manager->set_common_ignore_tensors({"text_encoders.llm.lm_head.",
+                                                          "model.diffusion_model.",
+                                                          "first_stage_model.",
+                                                          "audio_vae."});
+                if (!model_manager->validate_registered_tensors()) {
+                    LOG_ERROR("encode-only model metadata validation failed");
+                    return false;
+                }
+                LOG_INFO("encode-only: model metadata validation passed");
+                if (eager_load) {
+                    if (!model_manager->load_all_params_eagerly()) {
+                        LOG_ERROR("encode-only eager load failed");
+                        return false;
+                    }
+                    LOG_INFO("encode-only: eager load completed successfully");
+                }
+                LOG_INFO("encode-only mode: text encoder ready (skipping diffusion model / VAE / denoiser)");
+                return true;
+            }
+
+            // ---- Three-phase video: decode-only (VAE) early exit ----
+            // Only the VAE and optional audio VAE are registered. Skip TE,
+            // diffusion model, denoiser and control net entirely.
+            if (decode_only_mode) {
+                if (!ensure_backend_pair(SDBackendModule::VAE)) {
+                    LOG_ERROR("decode-only: failed to ensure VAE backend pair");
+                    return false;
+                }
+                // Create video VAE
+                first_stage_model = std::make_shared<LTXVideoVAE>(
+                    backend_for(SDBackendModule::VAE),
+                    tensor_storage_map,
+                    "first_stage_model",
+                    false,
+                    version,
+                    model_manager);
+                first_stage_model->set_max_graph_vram_bytes(
+                    max_graph_vram_bytes_for_module(SDBackendModule::VAE));
+                if (!register_runner_params("VAE",
+                                            first_stage_model,
+                                            SDBackendModule::VAE,
+                                            &vae_params_mem_size)) {
+                    return false;
+                }
+                // Create audio VAE if path was provided
+                if (!env_audio_vae_path.empty()) {
+                    audio_vae_model = std::make_shared<LTXV::LTXAudioVAERunner>(
+                        backend_for(SDBackendModule::VAE),
+                        tensor_storage_map,
+                        "",
+                        model_manager);
+                    if (!register_runner_params("audio VAE",
+                                                audio_vae_model,
+                                                SDBackendModule::VAE,
+                                                &vae_params_mem_size)) {
+                        return false;
+                    }
+                }
+                if (eager_load) {
+                    if (!model_manager->load_all_params_eagerly()) {
+                        LOG_ERROR("decode-only eager load failed");
+                        return false;
+                    }
+                    LOG_INFO("decode-only: eager load completed successfully");
+                }
+                LOG_INFO("decode-only mode: VAE ready (skipping text encoder / diffusion model / denoiser)");
+                return true;
             }
 
             diffusion_model->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::DIFFUSION));
@@ -1370,32 +1723,53 @@ public:
                 }
             }
 
-            if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0 && clip_vision == nullptr) {
-                if (!ensure_backend_pair(SDBackendModule::CLIP_VISION)) {
-                    return false;
-                }
-                clip_vision = std::make_shared<FrozenCLIPVisionEmbedder>(backend_for(SDBackendModule::CLIP_VISION),
-                                                                         tensor_storage_map,
-                                                                         model_manager);
-                clip_vision->set_max_graph_vram_bytes(max_graph_vram_bytes_for_module(SDBackendModule::CLIP_VISION));
-                if (!register_runner_params("CLIP vision",
-                                            clip_vision,
-                                            SDBackendModule::CLIP_VISION)) {
-                    return false;
+            // Apply flash attention settings before any early-exit paths
+            // so that diffusion-only contexts also get FA enabled.
+            if (sd_ctx_params->flash_attn || sd_ctx_params->diffusion_flash_attn) {
+                LOG_INFO("Using flash attention in the diffusion model");
+                diffusion_model->set_flash_attention_enabled(true);
+                if (high_noise_diffusion_model) {
+                    high_noise_diffusion_model->set_flash_attention_enabled(true);
                 }
             }
 
-            if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0) {
-                ip_adapter = std::make_shared<IPAdapter::IPAdapterRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                          tensor_storage_map,
-                                                                          "ip_adapter",
-                                                                          model_manager);
-                if (!register_runner_params("IP-Adapter",
-                                            ip_adapter,
-                                            SDBackendModule::DIFFUSION)) {
+            // ---- Three-phase video: diffusion-only early exit ----
+            // Skip VAE, audio VAE, control net, clip_vision creation entirely.
+            // The diffusion context has no VAE -- generate_video() will cache
+            // the latent without attempting VAE decode.
+            if (diffusion_only_mode) {
+                // Add VAE/TE tensors to ignore list so validation passes
+                std::set<std::string> ignore_tensors;
+                ignore_tensors.insert("first_stage_model.");
+                ignore_tensors.insert("audio_vae.");
+                ignore_tensors.insert("text_encoders.llm.");
+                ignore_tensors.insert("text_encoders.t5xxl.");
+                ignore_tensors.insert("conditioner.");
+                ignore_tensors.insert("model.diffusion_model.__x0__");
+                ignore_tensors.insert("model.diffusion_model.__32x32__");
+                ignore_tensors.insert("model.diffusion_model.__index_timestep_zero__");
+                model_manager->set_common_ignore_tensors(ignore_tensors);
+                if (!model_manager->validate_registered_tensors()) {
+                    LOG_ERROR("diffusion-only: model metadata validation failed");
                     return false;
                 }
+                LOG_INFO("diffusion-only: model metadata validation passed");
+                if (eager_load) {
+                    if (!model_manager->load_all_params_eagerly()) {
+                        LOG_ERROR("diffusion-only: eager load failed");
+                        return false;
+                    }
+                    LOG_INFO("diffusion-only: eager load completed successfully");
+                }
+                LOG_INFO("diffusion-only mode: diffusion model ready (skipping VAE / audio VAE / control net)");
+                return true;
             }
+
+            // ip_adapter_path removed for ABI compat — skip ip_adapter clip_vision setup
+            // (was: if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0 && clip_vision == nullptr) { ... })
+
+            // ip_adapter_path removed for ABI compat — skip ip_adapter creation
+            // (was: if (strlen(SAFE_STR(sd_ctx_params->ip_adapter_path)) > 0) { ... })
 
             if (!ensure_backend_pair(SDBackendModule::VAE)) {
                 return false;
@@ -1421,11 +1795,11 @@ public:
                 }
             };
 
-            sd_vae_format_t vae_format = sd_ctx_params->vae_format;
-            if (vae_format < SD_VAE_FORMAT_AUTO || vae_format >= SD_VAE_FORMAT_COUNT) {
-                LOG_WARN("invalid VAE format override, using auto");
-                vae_format = SD_VAE_FORMAT_AUTO;
-            }
+            sd_vae_format_t vae_format = SD_VAE_FORMAT_AUTO;  // hardcoded: vae_format removed from sd_ctx_params_t for ABI compat
+            // if (vae_format < SD_VAE_FORMAT_AUTO || vae_format >= SD_VAE_FORMAT_COUNT) {
+            //     LOG_WARN("invalid VAE format override, using auto");
+            //     vae_format = SD_VAE_FORMAT_AUTO;
+            // }
             SDVersion vae_version = version;
             if (sd_version_is_pid(version) && vae_format != SD_VAE_FORMAT_AUTO) {
                 vae_version = sd_vae_format_to_version(vae_format, vae_version);
@@ -1618,7 +1992,9 @@ public:
 
             if (sd_ctx_params->flash_attn) {
                 LOG_INFO("Using flash attention");
-                cond_stage_model->set_flash_attention_enabled(true);
+                if (cond_stage_model) {
+                    cond_stage_model->set_flash_attention_enabled(true);
+                }
                 if (clip_vision) {
                     clip_vision->set_flash_attention_enabled(true);
                 }
@@ -1644,6 +2020,13 @@ public:
         std::set<std::string> ignore_tensors;
         if (use_tae && !tae_preview_only) {
             ignore_tensors.insert("first_stage_model.");
+        }
+        // Decode-only mode: ignore diffusion model and TE tensors
+        if (decode_only_mode) {
+            ignore_tensors.insert("model.diffusion_model.");
+            ignore_tensors.insert("text_encoders.llm.");
+            ignore_tensors.insert("text_encoders.t5xxl.");
+            ignore_tensors.insert("conditioner.");
         }
         for (auto& extension : generation_extensions) {
             extension->add_ignore_tensors(ignore_tensors);
@@ -1683,6 +2066,30 @@ public:
         if (version == VERSION_HIDREAM_O1) {
             ignore_tensors.insert("lm_head.");
             ignore_tensors.insert("model.visual.deepstack_merger_list.");
+        }
+
+        // Z-Image / BooguImage: when loaded as diffusion-model-only (no TE/VAE in file),
+        // skip validation for conditioner (text_encoders.llm.) and VAE (first_stage_model.) tensors.
+        // The LLMEmbedder and AutoEncoderKL still register param tensors, but they have no weights
+        // to load from the file. They will be fed externally at generation time.
+        if (sd_version_is_z_image(version) || sd_version_is_boogu_image(version)) {
+            // Check if the model file actually lacks text encoder and VAE
+            const auto& ts_map = model_loader.get_tensor_storage_map();
+            bool has_te = false, has_vae = false;
+            for (const auto& [name, _] : ts_map) {
+                if (name.find("text_encoders.") == 0 || name.find("conditioner.") == 0) { has_te = true; break; }
+            }
+            for (const auto& [name, _] : ts_map) {
+                if (name.find("first_stage_model.") == 0) { has_vae = true; break; }
+            }
+            if (!has_te) {
+                ignore_tensors.insert("text_encoders.llm.");
+                LOG_INFO("Z-Image: no text encoder in model file, skipping TE validation");
+            }
+            if (!has_vae) {
+                ignore_tensors.insert("first_stage_model.");
+                LOG_INFO("Z-Image: no VAE in model file, skipping VAE validation");
+            }
         }
 
         model_manager->set_common_ignore_tensors(ignore_tensors);
@@ -2017,11 +2424,32 @@ public:
     }
 
     void apply_loras_at_runtime(const std::vector<ModelManager::LoraSpec>& loras) {
+        // LoRA 去重缓存：若 LoRA 列表与上次完全相同且已应用，直接复用 adapter，跳过重新解析文件
+        std::string sig;
+        for (const auto& l : loras) {
+            sig += l.path;
+            sig += ":";
+            sig += std::to_string(l.multiplier);
+            sig += l.is_high_noise ? ";h" : ";";
+            sig += l.tensor_name_prefix_filter;
+            sig += "|";
+        }
+        if (runtime_loras_applied && sig == cached_lora_signature) {
+            LOG_DEBUG("lora cache hit, reusing runtime adapters (skip re-loading)");
+            return;
+        }
+
+        // 仅在 LoRA 列表变化时清除 model_manager 的 immediately 模式 LoRA
+        // at_runtime 模式下 loras_ 始终为空，set_loras({}, ...) 是空操作不会释放参数
+        // 但若之前用 immediately 模式设置过 LoRA，需要清除
         if (model_manager != nullptr) {
             model_manager->set_loras({}, version);
         }
+
         runtime_lora_models.clear();
         clear_lora_adapters();
+        cached_lora_signature = sig;
+        runtime_loras_applied = false;
         if (loras.empty()) {
             return;
         }
@@ -2046,7 +2474,7 @@ public:
                                               lora_tensor_filter);
             // Only attach the adapter when there are LoRAs targeting the cond_stage model.
             // An empty MultiLoraAdapter still routes every linear/conv through
-            // forward_with_lora() instead of the direct kernel path — slower for no benefit.
+            // forward_with_lora() instead of the direct kernel path �?slower for no benefit.
             if (!cond_stage_lora_models.empty()) {
                 auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(cond_stage_lora_models);
                 cond_stage_model->set_weight_adapter(multi_lora_adapter);
@@ -2090,6 +2518,8 @@ public:
                 first_stage_model->set_weight_adapter(multi_lora_adapter);
             }
         }
+
+        runtime_loras_applied = true;
     }
 
     void lora_stat() {
@@ -2926,6 +3356,10 @@ public:
         if (sd_version_is_pid(version)) {
             return 1;
         }
+        if (!first_stage_model) {
+            // diffusion-only mode: no VAE loaded, return standard scale factor
+            return 8;
+        }
         return first_stage_model->get_scale_factor();
     }
 
@@ -3046,6 +3480,10 @@ public:
     }
 
     sd::Tensor<float> encode_first_stage(const sd::Tensor<float>& x) {
+        if (!first_stage_model) {
+            LOG_ERROR("encode_first_stage: no VAE loaded (diffusion-only mode)");
+            return {};
+        }
         auto latents = encode_to_vae_latents(x);
         if (latents.empty()) {
             return {};
@@ -3060,12 +3498,35 @@ public:
         if (sd_version_is_pid(version) || sd_version_is_minit2i(version)) {
             return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
         }
+        if (!first_stage_model) {
+            LOG_ERROR("decode_first_stage: no VAE loaded (diffusion-only mode)");
+            return {};
+        }
         auto latents = first_stage_model->diffusion_to_vae_latents(x);
         first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
         auto decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
         if (decoded.empty() && auto_fit_enabled) {
             bool prefer_temporal_tiling = decode_video && std::dynamic_pointer_cast<LTXVideoVAE>(first_stage_model) != nullptr;
+            // Level 1: temporal tiling (reduces frames per decode pass)
             if (sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling)) {
+                first_stage_model->free_compute_buffer();
+                first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
+                decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
+            }
+            // Level 2: spatial tiling ON TOP of temporal (reuces spatial dimensions per tile)
+            //          This handles cases where even 1-frame temporal tile's spatial
+            //          activation exceeds available VRAM (e.g. LTX VAE 32x upscale with
+            //          large latent W*H).  process_tiles_2d supports 5D via plane slicing.
+            if (decoded.empty()) {
+                LOG_WARN("VAE decode: temporal tiling did not help; retrying with spatial+temporal tiling");
+                vae_tiling_params.enabled = true;
+                vae_tiling_params.temporal_tiling = true;
+                if (vae_tiling_params.tile_size_x <= 0) {
+                    vae_tiling_params.tile_size_x = 32;  // latent-space tile size
+                }
+                if (vae_tiling_params.tile_size_y <= 0) {
+                    vae_tiling_params.tile_size_y = 32;
+                }
                 first_stage_model->free_compute_buffer();
                 first_stage_model->set_temporal_tiling_enabled(vae_tiling_params.temporal_tiling);
                 decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
@@ -3544,19 +4005,9 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->sampler_rng_type     = RNG_TYPE_COUNT;
     sd_ctx_params->prediction           = PREDICTION_COUNT;
     sd_ctx_params->lora_apply_mode      = LORA_APPLY_AUTO;
-    sd_ctx_params->max_vram             = nullptr;
-    sd_ctx_params->stream_layers        = false;
-    sd_ctx_params->eager_load           = false;
     sd_ctx_params->enable_mmap          = false;
     sd_ctx_params->diffusion_flash_attn = false;
-    sd_ctx_params->vae_format           = SD_VAE_FORMAT_AUTO;
-    sd_ctx_params->backend              = nullptr;
-    sd_ctx_params->params_backend       = nullptr;
-    sd_ctx_params->split_mode           = nullptr;
-    sd_ctx_params->auto_fit             = false;
-    sd_ctx_params->rpc_servers          = nullptr;
-    sd_ctx_params->model_args           = nullptr;
-    sd_ctx_params->pulid_weights_path   = nullptr;
+    sd_ctx_params->max_vram             = 0.f;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -3575,31 +4026,23 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "llm_vision_path: %s\n"
              "diffusion_model_path: %s\n"
              "high_noise_diffusion_model_path: %s\n"
-             "uncond_diffusion_model_path: %s\n"
-             "embeddings_connectors_path: %s\n"
              "vae_path: %s\n"
-             "audio_vae_path: %s\n"
              "taesd_path: %s\n"
              "control_net_path: %s\n"
              "photo_maker_path: %s\n"
-             "pulid_weights_path: %s\n"
              "tensor_type_rules: %s\n"
              "n_threads: %d\n"
              "wtype: %s\n"
              "rng_type: %s\n"
              "sampler_rng_type: %s\n"
              "prediction: %s\n"
-             "max_vram: %s\n"
-             "stream_layers: %s\n"
-             "eager_load: %s\n"
-             "backend: %s\n"
-             "params_backend: %s\n"
-             "split_mode: %s\n"
-             "model_args: %s\n"
-             "auto_fit: %s\n"
+             "max_vram: %.2f\n"
              "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
-             "vae_format: %s\n",
+             "vae_conv_direct: %s\n"
+             "diffusion_conv_direct: %s\n"
+             "force_sdxl_vae_conv_scale: %s\n"
+             "enable_mmap: %s\n",
              SAFE_STR(sd_ctx_params->model_path),
              SAFE_STR(sd_ctx_params->clip_l_path),
              SAFE_STR(sd_ctx_params->clip_g_path),
@@ -3609,31 +4052,23 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              SAFE_STR(sd_ctx_params->llm_vision_path),
              SAFE_STR(sd_ctx_params->diffusion_model_path),
              SAFE_STR(sd_ctx_params->high_noise_diffusion_model_path),
-             SAFE_STR(sd_ctx_params->uncond_diffusion_model_path),
-             SAFE_STR(sd_ctx_params->embeddings_connectors_path),
              SAFE_STR(sd_ctx_params->vae_path),
-             SAFE_STR(sd_ctx_params->audio_vae_path),
              SAFE_STR(sd_ctx_params->taesd_path),
              SAFE_STR(sd_ctx_params->control_net_path),
              SAFE_STR(sd_ctx_params->photo_maker_path),
-             SAFE_STR(sd_ctx_params->pulid_weights_path),
              SAFE_STR(sd_ctx_params->tensor_type_rules),
              sd_ctx_params->n_threads,
              sd_type_name(sd_ctx_params->wtype),
              sd_rng_type_name(sd_ctx_params->rng_type),
              sd_rng_type_name(sd_ctx_params->sampler_rng_type),
              sd_prediction_name(sd_ctx_params->prediction),
-             SAFE_STR(sd_ctx_params->max_vram),
-             BOOL_STR(sd_ctx_params->stream_layers),
-             BOOL_STR(sd_ctx_params->eager_load),
-             SAFE_STR(sd_ctx_params->backend),
-             SAFE_STR(sd_ctx_params->params_backend),
-             SAFE_STR(sd_ctx_params->split_mode),
-             SAFE_STR(sd_ctx_params->model_args),
-             BOOL_STR(sd_ctx_params->auto_fit),
+             sd_ctx_params->max_vram,
              BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
-             sd_vae_format_name(sd_ctx_params->vae_format));
+             BOOL_STR(sd_ctx_params->vae_conv_direct),
+             BOOL_STR(sd_ctx_params->diffusion_conv_direct),
+             BOOL_STR(sd_ctx_params->force_sdxl_vae_conv_scale),
+             BOOL_STR(sd_ctx_params->enable_mmap));
 
     return buf;
 }
@@ -3951,6 +4386,13 @@ SD_API bool sd_ctx_has_control_net(const sd_ctx_t* sd_ctx) {
         return false;
     }
     return sd_ctx->sd->control_net != nullptr;
+}
+
+SD_API void sd_ctx_set_control_net_wtype(sd_ctx_t* sd_ctx, enum sd_type_t wtype) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        return;
+    }
+    sd_ctx->sd->control_net_wtype = sd_type_to_ggml_type(wtype);
 }
 
 enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx) {
@@ -5312,7 +5754,8 @@ static sd_image_t* decode_image_outputs(sd_ctx_t* sd_ctx,
         LOG_INFO("decoding %zu latents", final_latents.size());
     }
     std::vector<sd::Tensor<float>> decoded_images;
-    int64_t t0     = ggml_time_ms();
+    int64_t t0                    = ggml_time_ms();
+    LOG_INFO("[Stage] === generate_video begin: Diffusion + VAE pipeline ===");
     bool cancelled = false;
 
     for (size_t i = 0; i < final_latents.size(); i++) {
@@ -6493,6 +6936,95 @@ static std::optional<ImageGenerationLatents> prepare_video_generation_latents(sd
     return latents;
 }
 
+// =========================================================================
+//  Two-phase LTX-2.3 support: embedding file (de)serialization
+//  File layout (little-endian):
+//    [4 bytes] magic "LTXE"
+//    [4 bytes] uint32 version = 1
+//    [4 bytes] uint32 ndim
+//    [8*ndim bytes] int64 shape[ndim]
+//    [8 bytes] int64 numel
+//    [4*numel bytes] float32 data
+// =========================================================================
+static const uint32_t kLtxEmbeddingMagic = 0x4558544C;  // "LTXE"
+
+static bool save_embedding_to_file(const std::string& path, const sd::Tensor<float>& tensor) {
+    if (path.empty() || tensor.empty()) {
+        LOG_ERROR("save_embedding_to_file: empty path or tensor");
+        return false;
+    }
+    FILE* fp = fopen(path.c_str(), "wb");
+    if (fp == nullptr) {
+        LOG_ERROR("save_embedding_to_file: cannot open '%s' for writing", path.c_str());
+        return false;
+    }
+
+    const std::vector<int64_t>& shape = tensor.shape();
+    uint32_t ndim                     = static_cast<uint32_t>(shape.size());
+    int64_t numel                     = tensor.numel();
+
+    bool ok = true;
+    ok = ok && fwrite(&kLtxEmbeddingMagic, sizeof(kLtxEmbeddingMagic), 1, fp) == 1;
+    const uint32_t version = 1;
+    ok = ok && fwrite(&version, sizeof(version), 1, fp) == 1;
+    ok = ok && fwrite(&ndim, sizeof(ndim), 1, fp) == 1;
+    for (int64_t d : shape) {
+        ok = ok && fwrite(&d, sizeof(d), 1, fp) == 1;
+    }
+    ok = ok && fwrite(&numel, sizeof(numel), 1, fp) == 1;
+    if (ok && numel > 0) {
+        ok = fwrite(tensor.data(), sizeof(float), static_cast<size_t>(numel), fp) ==
+             static_cast<size_t>(numel);
+    }
+
+    fclose(fp);
+    if (!ok) {
+        LOG_ERROR("save_embedding_to_file: write failed for '%s'", path.c_str());
+        remove(path.c_str());
+    }
+    return ok;
+}
+
+static sd::Tensor<float> load_embedding_from_file(const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (fp == nullptr) {
+        LOG_ERROR("load_embedding_from_file: cannot open '%s'", path.c_str());
+        return {};
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t ndim = 0;
+    bool ok = true;
+    ok = ok && fread(&magic, sizeof(magic), 1, fp) == 1 && magic == kLtxEmbeddingMagic;
+    ok = ok && fread(&version, sizeof(version), 1, fp) == 1 && version == 1;
+    ok = ok && fread(&ndim, sizeof(ndim), 1, fp) == 1 && ndim <= 8;
+    std::vector<int64_t> shape(ndim, 0);
+    for (uint32_t i = 0; ok && i < ndim; ++i) {
+        ok = fread(&shape[i], sizeof(int64_t), 1, fp) == 1 && shape[i] > 0;
+    }
+    int64_t numel = 0;
+    ok = ok && fread(&numel, sizeof(numel), 1, fp) == 1 && numel > 0 && numel < (int64_t)1 << 40;
+
+    sd::Tensor<float> result;
+    if (ok) {
+        std::vector<float> data(static_cast<size_t>(numel));
+        if (fread(data.data(), sizeof(float), static_cast<size_t>(numel), fp) == static_cast<size_t>(numel)) {
+            result = sd::Tensor<float>(shape, std::move(data));
+        } else {
+            LOG_ERROR("load_embedding_from_file: data read failed for '%s'", path.c_str());
+        }
+    } else {
+        LOG_ERROR("load_embedding_from_file: header parse failed for '%s'", path.c_str());
+    }
+
+    fclose(fp);
+    return result;
+}
+
 static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
                                                              const sd_vid_gen_params_t* sd_vid_gen_params,
                                                              const GenerationRequest& request,
@@ -6500,6 +7032,41 @@ static ImageGenerationEmbeds prepare_video_generation_embeds(sd_ctx_t* sd_ctx,
     ConditionerRunnerDoneOnExit conditioner_runner_done{sd_ctx->sd->cond_stage_model.get()};
 
     ImageGenerationEmbeds embeds;
+
+    // ---- Two-phase LTX-2.3: use precomputed conditioning embeddings ----
+    // The text encoder was run earlier by sd_encode_ltxav_prompt() and the
+    // resulting c_crossattn tensors were serialized to disk. Load them back
+    // and skip the (memory-hungry) text-encoder pass entirely.
+    if (sd_ctx->sd->use_precomputed_embeddings) {
+        embeds.cond.c_crossattn = load_embedding_from_file(sd_ctx->sd->precomputed_cond_embedding_path);
+        if (embeds.cond.c_crossattn.empty()) {
+            LOG_ERROR("failed to load precomputed cond embedding from '%s'",
+                      sd_ctx->sd->precomputed_cond_embedding_path.c_str());
+            return embeds;
+        }
+        embeds.cond.c_concat = latents.concat_latent;
+        embeds.cond.c_vector = latents.clip_vision_output;
+        LOG_INFO("using precomputed cond embedding from '%s' (shape %s)",
+                 sd_ctx->sd->precomputed_cond_embedding_path.c_str(),
+                 sd::tensor_shape_to_string(embeds.cond.c_crossattn.shape()).c_str());
+
+        if (request.use_uncond && !sd_ctx->sd->precomputed_uncond_embedding_path.empty()) {
+            embeds.uncond.c_crossattn = load_embedding_from_file(sd_ctx->sd->precomputed_uncond_embedding_path);
+            if (embeds.uncond.c_crossattn.empty()) {
+                LOG_ERROR("failed to load precomputed uncond embedding from '%s'",
+                          sd_ctx->sd->precomputed_uncond_embedding_path.c_str());
+                return ImageGenerationEmbeds();
+            }
+            embeds.uncond.c_concat = latents.concat_latent;
+            embeds.uncond.c_vector = latents.clip_vision_output;
+            LOG_INFO("using precomputed uncond embedding from '%s' (shape %s)",
+                     sd_ctx->sd->precomputed_uncond_embedding_path.c_str(),
+                     sd::tensor_shape_to_string(embeds.uncond.c_crossattn.shape()).c_str());
+        }
+
+        return embeds;
+    }
+
     ConditionerParams condition_params;
     condition_params.clip_skip             = request.clip_skip;
     condition_params.text                  = request.prompt;
@@ -6896,6 +7463,11 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                                                                    sd_vid_gen_params,
                                                                    request,
                                                                    latents);
+    if (embeds.cond.c_crossattn.empty()) {
+        LOG_ERROR("generate_video: conditioning embeddings are empty "
+                  "(text encoder missing or precomputed embeddings could not be loaded)");
+        return false;
+    }
     if (latent_upscale_enabled) {
         LOG_INFO("generate_video %dx%dx%d -> LTX latent spatial upscale",
                  request.width,
@@ -6968,6 +7540,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         return false;
     }
     LOG_DEBUG("sample %dx%dx%d", W, H, T);
+    LOG_INFO("[Stage] Diffusion sampling begin — weights GPU-resident for entire loop, free_compute_params=false");
     int64_t sampling_start         = ggml_time_ms();
     sd::Tensor<float> final_latent = sd_ctx->sd->sample(sd_ctx->sd->diffusion_model,
                                                         true,
@@ -7000,6 +7573,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         LOG_ERROR("sampling failed after %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
         return false;
     }
+    LOG_INFO("[Stage] Diffusion sampling end — runner_done() released GPU weight staging");
     LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
 
     if (latent_upscale_enabled) {
@@ -7145,6 +7719,24 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
     int64_t latent_end = ggml_time_ms();
     LOG_INFO("generating latent video completed, taking %.2fs", (latent_end - latent_start) * 1.0f / 1000);
 
+    // ---- Three-phase video: decode-only / diffusion-only skip ----
+    // In decode-only or diffusion-only mode the context has no VAE loaded.
+    // Cache the latent for sd_save_video_latent() and skip all VAE/audio decode.
+    if (sd_ctx->sd->decode_only_mode || sd_ctx->sd->diffusion_only_mode) {
+        sd_ctx->sd->cached_final_latent = final_latent;
+        sd_ctx->sd->cached_audio_length = latents.audio_length;
+        LOG_INFO("[Stage] Decode-only mode: latent cached (%dx%dx%dx%d), skipping VAE decode",
+                 (int)final_latent.shape()[0], (int)final_latent.shape()[1],
+                 (int)final_latent.shape()[2], (int)final_latent.shape()[3]);
+        int64_t t1 = ggml_time_ms();
+        LOG_INFO("[Stage] === generate_video end (decode-only): sampling only ===");
+        LOG_INFO("generate_video completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+        if (frames_out != nullptr) { *frames_out = nullptr; }
+        if (num_frames_out != nullptr) { *num_frames_out = 0; }
+        if (audio_out != nullptr) { *audio_out = nullptr; }
+        return true;
+    }
+
     sd_audio_t* generated_audio = nullptr;
     if ((sd_version_is_ltxav(sd_ctx->sd->version) || sd_version_is_minimax_h3(sd_ctx->sd->version)) &&
         latents.audio_length > 0 &&
@@ -7153,6 +7745,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
             LOG_ERROR("cancelling generation before audio decode");
             return false;
         }
+        LOG_INFO("[Stage] Audio VAE decode begin — latent preserved from Diffusion stage");
         int64_t audio_latent_decode_start = ggml_time_ms();
 
         auto audio_latent = sd_version_is_minimax_h3(sd_ctx->sd->version)
@@ -7176,6 +7769,7 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
             }
         }
         int64_t audio_latent_decode_end = ggml_time_ms();
+        LOG_INFO("[Stage] Audio VAE decode end");
         LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_latent_decode_end - audio_latent_decode_start) * 1.0f / 1000);
     }
 
@@ -7194,15 +7788,18 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
         free_sd_audio(generated_audio);
         return false;
     }
+    LOG_INFO("[Stage] Video VAE decode begin — latent preserved from Diffusion stage");
     auto result = decode_video_outputs(sd_ctx, latent_upscale_enabled ? hires_request : request, final_latent, num_frames_out);
     if (result == nullptr) {
         free_sd_audio(generated_audio);
         return false;
     }
+    LOG_INFO("[Stage] Video VAE decode end");
 
     sd_ctx->sd->lora_stat();
 
     int64_t t1 = ggml_time_ms();
+    LOG_INFO("[Stage] === generate_video end: pipeline completed ===");
     LOG_INFO("generate_video completed in %.2fs", (t1 - t0) * 1.0f / 1000);
     if (frames_out != nullptr) {
         *frames_out = result;
@@ -7228,4 +7825,959 @@ SD_API void free_sd_images(sd_image_t* result_images, int num_images) {
     }
 
     free(result_images);
+}
+
+// ===========================================================================
+// Two-phase LTX-2.3 video generation support
+// ===========================================================================
+
+// Internal: create a text-encoder-only context used by sd_encode_video_prompt().
+//   encoder_type: 0=LTX2, 1=Wan, 2=HunyuanVideo, 3=MiniMax-H3
+//   te_path:      text encoder model path (Gemma LLM / T5 XXL / MLLM).
+//   extra_path:   encoder extra weights (LTX-2.3 embeddings connectors; may be NULL).
+static sd_ctx_t* new_video_encoder_ctx(int encoder_type,
+                                       const char* te_path,
+                                       const char* extra_path,
+                                       int n_threads) {
+    LOG_INFO("new_video_encoder_ctx: enter (encoder_type=%d, te_path=%s, extra_path=%s, n_threads=%d)",
+             encoder_type, te_path ? te_path : "(null)", extra_path ? extra_path : "(null)", n_threads);
+    if (te_path == nullptr || strlen(te_path) == 0) {
+        LOG_ERROR("new_video_encoder_ctx: te_path is required");
+        return nullptr;
+    }
+
+    sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+    if (sd_ctx == nullptr) {
+        return nullptr;
+    }
+
+    sd_ctx->sd = new StableDiffusionGGML();
+    if (sd_ctx->sd == nullptr) {
+        free(sd_ctx);
+        return nullptr;
+    }
+
+    sd_ctx->sd->encode_only_mode             = true;
+    sd_ctx->sd->encode_encoder_type          = encoder_type;
+    sd_ctx->sd->internal_encoder_extra_path  = extra_path ? extra_path : "";
+
+    // In video mode, ensure the encoder ctx doesn't inherit a stale SD_PARAMS_BACKEND
+    // from a previous phase. The init() function already detects SD_VIDEO_MODE=1
+    // and handles params_backend_spec accordingly, but we clear it here too as
+    // a belt-and-suspenders measure.
+    {
+#ifdef _WIN32
+        SetEnvironmentVariableA("SD_PARAMS_BACKEND", "");
+#else
+        setenv("SD_PARAMS_BACKEND", "", 1);
+#endif
+    }
+
+    sd_ctx_params_t params;
+    sd_ctx_params_init(&params);
+    params.n_threads   = n_threads;
+    // Enable auto_fit with auto-detect so the text encoder weights are placed
+    // on GPU when there is enough VRAM (Gemma 5.2GB < 8GB VRAM → should fit).
+    // Without this, params.max_vram defaults to 0 → auto_fit is never enabled
+    // for the encode-only context → weights default to CPU → no CUDA utilisation.
+    params.max_vram   = -1;  // auto-detect free VRAM
+    // Disable Flash Attention for encoding: text encoders (Gemma/T5/MLLM) may
+    // encounter CPU flash attention integer-div-by-zero risk on large dense
+    // masks. Single-prompt encoding gains negligible from FA. Sampling stage
+    // (GPU) still uses FA.
+    params.flash_attn  = false;
+    if (encoder_type == 1) {
+        // Wan2.x: T5 XXL text encoder
+        params.t5xxl_path = te_path;
+    } else {
+        // LTX2 (Gemma), HunyuanVideo (MLLM), MiniMax-H3 (LLM): llm path
+        params.llm_path = te_path;
+    }
+
+    if (!sd_ctx->sd->init(&params)) {
+        delete sd_ctx->sd;
+        sd_ctx->sd = nullptr;
+        free(sd_ctx);
+        return nullptr;
+    }
+    return sd_ctx;
+}
+
+SD_API bool sd_encode_video_prompt(enum sd_video_encoder_type_t encoder_type,
+                                   const char* te_path,
+                                   const char* te_extra_path,
+                                   const char* prompt,
+                                   const char* negative_prompt,
+                                   int n_threads,
+                                   const char* cond_out_path,
+                                   const char* uncond_out_path) {
+    // CRITICAL: ggml_time_ms() divides by timer_freq which is 0 until ggml_time_init()
+    // is called. On cold start (no prior ggml call), this causes 0xC0000094 (integer div-by-zero).
+#ifdef _WIN32
+    ggml_time_init();
+#endif
+    LOG_INFO("sd_encode_video_prompt: enter, encoder_type=%d", (int)encoder_type);
+    if (encoder_type < SD_VIDEO_ENCODER_LTX2 || encoder_type >= SD_VIDEO_ENCODER_COUNT) {
+        LOG_ERROR("sd_encode_video_prompt: invalid encoder_type %d", (int)encoder_type);
+        return false;
+    }
+    if (te_path == nullptr || prompt == nullptr || cond_out_path == nullptr) {
+        LOG_ERROR("sd_encode_video_prompt: invalid arguments (te_path, prompt, cond_out_path are required)");
+        return false;
+    }
+    if (encoder_type == SD_VIDEO_ENCODER_LTX2 && (te_extra_path == nullptr || strlen(te_extra_path) == 0)) {
+        LOG_ERROR("sd_encode_video_prompt: LTX-2.3 encoder requires embeddings connectors path");
+        return false;
+    }
+
+    int64_t t0 = ggml_time_ms();
+
+    LOG_INFO("[Stage] Text Encoder begin — load, encode, sync, release");
+    sd_ctx_t* ctx = new_video_encoder_ctx((int)encoder_type, te_path, te_extra_path, n_threads);
+    if (ctx == nullptr || ctx->sd == nullptr || ctx->sd->cond_stage_model == nullptr) {
+        LOG_ERROR("sd_encode_video_prompt: failed to create text-encoder context");
+        if (ctx != nullptr) {
+            free_sd_ctx(ctx);
+        }
+        return false;
+    }
+
+    bool ok = true;
+
+    // ---- Encode positive prompt ----
+    ConditionerParams cond_params;
+    cond_params.text = prompt;
+    SDCondition cond = ctx->sd->cond_stage_model->get_learned_condition(n_threads, cond_params);
+    if (cond.c_crossattn.empty()) {
+        LOG_ERROR("sd_encode_video_prompt: encoding cond prompt failed");
+        ok = false;
+    } else if (!save_embedding_to_file(cond_out_path, cond.c_crossattn)) {
+        LOG_ERROR("sd_encode_video_prompt: failed to save cond embedding to '%s'", cond_out_path);
+        ok = false;
+    } else {
+        LOG_INFO("sd_encode_video_prompt: cond embedding saved to '%s' (shape %s, %.2f MB)",
+                 cond_out_path,
+                 sd::tensor_shape_to_string(cond.c_crossattn.shape()).c_str(),
+                 cond.c_crossattn.numel() * sizeof(float) / 1024.0 / 1024.0);
+    }
+
+    // ---- Encode negative prompt (optional) ----
+    if (ok && negative_prompt != nullptr && uncond_out_path != nullptr && strlen(uncond_out_path) > 0) {
+        ConditionerParams uncond_params;
+        uncond_params.text = negative_prompt;
+        SDCondition uncond = ctx->sd->cond_stage_model->get_learned_condition(n_threads, uncond_params);
+        if (uncond.c_crossattn.empty()) {
+            LOG_ERROR("sd_encode_video_prompt: encoding uncond prompt failed");
+            ok = false;
+        } else if (!save_embedding_to_file(uncond_out_path, uncond.c_crossattn)) {
+            LOG_ERROR("sd_encode_video_prompt: failed to save uncond embedding to '%s'", uncond_out_path);
+            ok = false;
+        } else {
+            LOG_INFO("sd_encode_video_prompt: uncond embedding saved to '%s' (shape %s)",
+                     uncond_out_path,
+                     sd::tensor_shape_to_string(uncond.c_crossattn.shape()).c_str());
+        }
+    }
+
+    // Release the text-encoder context (frees all encoder memory).
+    ctx->sd->cond_stage_model->runner_done();
+    // CUDA sync: ensure all pending GPU operations are complete before
+    // freeing the context. This prevents race conditions where the CUDA
+    // backend still has in-flight operations when the backend is destroyed.
+    {
+        ggml_backend_t te_backend = ctx->sd->backend_manager.runtime_backend(SDBackendModule::TE);
+        if (te_backend != nullptr && !sd_backend_is_cpu(te_backend)) {
+            LOG_INFO("sd_encode_video_prompt: synchronizing TE backend before context release");
+            ggml_backend_synchronize(te_backend);
+        }
+    }
+    free_sd_ctx(ctx);
+
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("[Stage] Text Encoder end — context released, embeddings persisted to disk");
+    LOG_INFO("sd_encode_video_prompt completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+    return ok;
+}
+
+SD_API bool sd_encode_ltxav_prompt(const char* llm_path,
+                                   const char* embeddings_connectors_path,
+                                   const char* prompt,
+                                   const char* negative_prompt,
+                                   int n_threads,
+                                   const char* cond_out_path,
+                                   const char* uncond_out_path) {
+    // Convenience wrapper: LTX-2.3 encoder.
+    return sd_encode_video_prompt(SD_VIDEO_ENCODER_LTX2,
+                                  llm_path,
+                                  embeddings_connectors_path,
+                                  prompt,
+                                  negative_prompt,
+                                  n_threads,
+                                  cond_out_path,
+                                  uncond_out_path);
+}
+
+SD_API bool sd_ctx_set_precomputed_embeddings(sd_ctx_t* sd_ctx,
+                                              const char* cond_embedding_path,
+                                              const char* uncond_embedding_path) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || cond_embedding_path == nullptr ||
+        strlen(cond_embedding_path) == 0) {
+        LOG_ERROR("sd_ctx_set_precomputed_embeddings: invalid arguments");
+        return false;
+    }
+
+    sd_ctx->sd->use_precomputed_embeddings             = true;
+    sd_ctx->sd->precomputed_cond_embedding_path        = cond_embedding_path;
+    sd_ctx->sd->precomputed_uncond_embedding_path      = uncond_embedding_path ? uncond_embedding_path : "";
+    LOG_INFO("sd_ctx_set_precomputed_embeddings: cond='%s', uncond='%s'",
+             cond_embedding_path,
+             sd_ctx->sd->precomputed_uncond_embedding_path.c_str());
+    return true;
+}
+
+// ===========================================================================
+// Three-phase video generation: Phase 2 (decode-only) + Phase 3 (VAE decode)
+// ===========================================================================
+
+SD_API bool sd_ctx_set_decode_only(sd_ctx_t* sd_ctx, bool decode_only) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr) {
+        LOG_ERROR("sd_ctx_set_decode_only: invalid context");
+        return false;
+    }
+    sd_ctx->sd->decode_only_mode = decode_only;
+    LOG_INFO("sd_ctx_set_decode_only: %s", decode_only ? "ON (VAE will be skipped)" : "OFF");
+    return true;
+}
+
+SD_API bool sd_save_video_latent(sd_ctx_t* sd_ctx, const char* latent_out_path) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || latent_out_path == nullptr) {
+        LOG_ERROR("sd_save_video_latent: invalid arguments");
+        return false;
+    }
+    auto& latent = sd_ctx->sd->cached_final_latent;
+    if (latent.empty()) {
+        LOG_ERROR("sd_save_video_latent: no cached latent (generate_video not called or failed)");
+        return false;
+    }
+
+    FILE* f = fopen(latent_out_path, "wb");
+    if (f == nullptr) {
+        LOG_ERROR("sd_save_video_latent: cannot open '%s' for writing", latent_out_path);
+        return false;
+    }
+
+    // Header: "SDLT" + 4×int64 shape + 1×int32 audio_length
+    fwrite("SDLT", 1, 4, f);
+    int32_t ndim = (int32_t)latent.dim();
+    fwrite(&ndim, sizeof(int32_t), 1, f);
+    for (int i = 0; i < latent.dim(); i++) {
+        int64_t dim = latent.shape()[i];
+        fwrite(&dim, sizeof(int64_t), 1, f);
+    }
+    int32_t audio_len = sd_ctx->sd->cached_audio_length;
+    fwrite(&audio_len, sizeof(int32_t), 1, f);
+
+    // Data: raw float32
+    size_t num_elements = (size_t)latent.numel();
+    fwrite(latent.data(), sizeof(float), num_elements, f);
+
+    long file_size = ftell(f);
+    fclose(f);
+
+    LOG_INFO("sd_save_video_latent: saved %zu elements (%.2f MB) to '%s'",
+             num_elements,
+             (float)(num_elements * sizeof(float)) / (1024.f * 1024.f),
+             latent_out_path);
+    LOG_INFO("sd_save_video_latent: header ndim=%d, shape=[%lld,%lld,%lld,%lld,%lld], audio_length=%d, file_size=%ld bytes",
+             ndim,
+             latent.dim() > 0 ? (long long)latent.shape()[0] : 0LL,
+             latent.dim() > 1 ? (long long)latent.shape()[1] : 0LL,
+             latent.dim() > 2 ? (long long)latent.shape()[2] : 0LL,
+             latent.dim() > 3 ? (long long)latent.shape()[3] : 0LL,
+             latent.dim() > 4 ? (long long)latent.shape()[4] : 0LL,
+             audio_len,
+             file_size);
+    return true;
+}
+
+// Internal helper: load a latent from a .bin file saved by sd_save_video_latent
+static bool load_video_latent_from_file(const char* path, sd::Tensor<float>& out_latent, int& out_audio_length) {
+    FILE* f = fopen(path, "rb");
+    if (f == nullptr) {
+        LOG_ERROR("load_video_latent: cannot open '%s'", path);
+        return false;
+    }
+
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "SDLT", 4) != 0) {
+        LOG_ERROR("load_video_latent: invalid header magic (expected SDLT)");
+        fclose(f);
+        return false;
+    }
+
+    int32_t ndim = 0;
+    if (fread(&ndim, sizeof(int32_t), 1, f) != 1 || ndim < 1 || ndim > 5) {
+        LOG_ERROR("load_video_latent: invalid ndim %d", ndim);
+        fclose(f);
+        return false;
+    }
+
+    std::vector<int64_t> shape(ndim);
+    for (int i = 0; i < ndim; i++) {
+        if (fread(&shape[i], sizeof(int64_t), 1, f) != 1) {
+            LOG_ERROR("load_video_latent: failed to read shape[%d]", i);
+            fclose(f);
+            return false;
+        }
+    }
+
+    int32_t audio_length = 0;
+    if (fread(&audio_length, sizeof(int32_t), 1, f) != 1) {
+        LOG_ERROR("load_video_latent: failed to read audio_length");
+        fclose(f);
+        return false;
+    }
+
+    size_t num_elements = 1;
+    for (int i = 0; i < ndim; i++) {
+        num_elements *= (size_t)shape[i];
+    }
+
+    out_latent = sd::Tensor<float>(shape);
+    if (fread(out_latent.data(), sizeof(float), num_elements, f) != num_elements) {
+        LOG_ERROR("load_video_latent: failed to read %zu float elements", num_elements);
+        fclose(f);
+        return false;
+    }
+
+    out_audio_length = audio_length;
+    fclose(f);
+
+    LOG_INFO("load_video_latent: loaded %zu elements from '%s', ndim=%d, shape=[%lld,%lld,%lld,%lld,%lld], audio_length=%d",
+             num_elements, path, ndim,
+             ndim > 0 ? (long long)shape[0] : 0LL,
+             ndim > 1 ? (long long)shape[1] : 0LL,
+             ndim > 2 ? (long long)shape[2] : 0LL,
+             ndim > 3 ? (long long)shape[3] : 0LL,
+             ndim > 4 ? (long long)shape[4] : 0LL,
+             audio_length);
+    return true;
+}
+
+// Internal: create a VAE-only context for Phase 3 latent decoding.
+static sd_ctx_t* new_video_vae_ctx_internal(const char* vae_path,
+                                              const char* audio_vae_path,
+                                              int n_threads,
+                                              int max_vram) {
+    LOG_INFO("new_video_vae_ctx: enter (vae_path=%s, audio_vae_path=%s, n_threads=%d, max_vram=%d)",
+             vae_path ? vae_path : "(null)",
+             audio_vae_path ? audio_vae_path : "(null)",
+             n_threads, max_vram);
+
+    if (vae_path == nullptr || strlen(vae_path) == 0) {
+        LOG_ERROR("new_video_vae_ctx: vae_path is required");
+        return nullptr;
+    }
+
+    sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+    if (sd_ctx == nullptr) {
+        return nullptr;
+    }
+
+    sd_ctx->sd = new StableDiffusionGGML();
+    if (sd_ctx->sd == nullptr) {
+        free(sd_ctx);
+        return nullptr;
+    }
+
+    sd_ctx->sd->decode_only_mode = true;
+
+    // Set audio VAE path via environment variable (same mechanism as init())
+    if (audio_vae_path != nullptr && strlen(audio_vae_path) > 0) {
+#ifdef _WIN32
+        SetEnvironmentVariableA("SD_AUDIO_VAE_PATH", audio_vae_path);
+#else
+        setenv("SD_AUDIO_VAE_PATH", audio_vae_path, 1);
+#endif
+    } else {
+#ifdef _WIN32
+        SetEnvironmentVariableA("SD_AUDIO_VAE_PATH", "");
+#else
+        unsetenv("SD_AUDIO_VAE_PATH");
+#endif
+    }
+
+    // Ensure video mode settings are applied
+#ifdef _WIN32
+    SetEnvironmentVariableA("SD_VIDEO_MODE", "1");
+    SetEnvironmentVariableA("SD_PARAMS_BACKEND", "");
+#else
+    setenv("SD_VIDEO_MODE", "1", 1);
+    setenv("SD_PARAMS_BACKEND", "", 1);
+#endif
+
+    sd_ctx_params_t params;
+    sd_ctx_params_init(&params);
+    params.n_threads      = n_threads;
+    params.flash_attn     = false;
+    params.vae_path       = vae_path;
+    params.max_vram       = max_vram;
+    params.enable_mmap    = false;
+
+    if (!sd_ctx->sd->init(&params)) {
+        LOG_ERROR("new_video_vae_ctx: init failed");
+        delete sd_ctx->sd;
+        sd_ctx->sd = nullptr;
+        free(sd_ctx);
+        return nullptr;
+    }
+
+    LOG_INFO("new_video_vae_ctx: VAE context created successfully");
+    return sd_ctx;
+}
+
+SD_API sd_ctx_t* new_video_vae_ctx(const char* vae_path,
+                                    const char* audio_vae_path,
+                                    int n_threads,
+                                    int max_vram) {
+    return new_video_vae_ctx_internal(vae_path, audio_vae_path, n_threads, max_vram);
+}
+
+// Internal: create a diffusion-only context for Phase 2 sampling.
+static sd_ctx_t* new_video_diffusion_ctx_internal(const char* diffusion_model_path,
+                                                    int n_threads,
+                                                    int max_vram,
+                                                    bool flash_attn) {
+    LOG_INFO("new_video_diffusion_ctx: enter (diffusion_model_path=%s, n_threads=%d, max_vram=%d, flash_attn=%d)",
+             diffusion_model_path ? diffusion_model_path : "(null)",
+             n_threads, max_vram, flash_attn);
+
+    if (diffusion_model_path == nullptr || strlen(diffusion_model_path) == 0) {
+        LOG_ERROR("new_video_diffusion_ctx: diffusion_model_path is required");
+        return nullptr;
+    }
+
+    sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+    if (sd_ctx == nullptr) {
+        return nullptr;
+    }
+
+    sd_ctx->sd = new StableDiffusionGGML();
+    if (sd_ctx->sd == nullptr) {
+        free(sd_ctx);
+        return nullptr;
+    }
+
+    sd_ctx->sd->diffusion_only_mode = true;
+
+    // Ensure video mode settings are applied (same as new_video_vae_ctx)
+#ifdef _WIN32
+    SetEnvironmentVariableA("SD_VIDEO_MODE", "1");
+    SetEnvironmentVariableA("SD_PARAMS_BACKEND", "");
+    SetEnvironmentVariableA("SD_AUDIO_VAE_PATH", "");
+#else
+    setenv("SD_VIDEO_MODE", "1", 1);
+    setenv("SD_PARAMS_BACKEND", "", 1);
+    unsetenv("SD_AUDIO_VAE_PATH");
+#endif
+
+    sd_ctx_params_t params;
+    sd_ctx_params_init(&params);
+    params.diffusion_model_path   = diffusion_model_path;
+    params.n_threads              = n_threads;
+    params.flash_attn             = flash_attn;
+    params.diffusion_flash_attn   = flash_attn;
+    params.max_vram               = max_vram;
+    params.enable_mmap            = false;
+
+    if (!sd_ctx->sd->init(&params)) {
+        LOG_ERROR("new_video_diffusion_ctx: init failed");
+        delete sd_ctx->sd;
+        sd_ctx->sd = nullptr;
+        free(sd_ctx);
+        return nullptr;
+    }
+
+    LOG_INFO("new_video_diffusion_ctx: diffusion context created successfully");
+    return sd_ctx;
+}
+
+SD_API sd_ctx_t* new_video_diffusion_ctx(const char* diffusion_model_path,
+                                          int n_threads,
+                                          int max_vram,
+                                          bool flash_attn) {
+    return new_video_diffusion_ctx_internal(diffusion_model_path, n_threads, max_vram, flash_attn);
+}
+
+SD_API bool sd_decode_video_latent(sd_ctx_t* sd_ctx,
+                                    const char* latent_path,
+                                    int width,
+                                    int height,
+                                    int vae_scale_factor,
+                                    int audio_length,
+                                    float fps,
+                                    sd_image_t** frames_out,
+                                    int* num_frames_out,
+                                    sd_audio_t** audio_out) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || latent_path == nullptr) {
+        LOG_ERROR("sd_decode_video_latent: invalid arguments");
+        return false;
+    }
+    if (!sd_ctx->sd->decode_only_mode) {
+        LOG_ERROR("sd_decode_video_latent: context is not in decode-only mode");
+        return false;
+    }
+
+    // Load latent from disk
+    sd::Tensor<float> final_latent;
+    int loaded_audio_length = 0;
+    if (!load_video_latent_from_file(latent_path, final_latent, loaded_audio_length)) {
+        return false;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    LOG_INFO("[Stage] === sd_decode_video_latent begin ===");
+
+    // Slice off conditioning frames if present (same logic as generate_video)
+    if (loaded_audio_length > 0) {
+        // Keep audio packed; will be unpacked below
+    }
+
+    // Audio VAE decode
+    sd_audio_t* generated_audio = nullptr;
+    if (sd_version_is_ltxav(sd_ctx->sd->version) && loaded_audio_length > 0 &&
+        sd_ctx->sd->audio_vae_model != nullptr) {
+        LOG_INFO("[Stage] Audio VAE decode begin — latent from disk");
+        int64_t audio_start = ggml_time_ms();
+        auto audio_latent = unpack_ltxav_audio_latent(final_latent,
+                                                       loaded_audio_length,
+                                                       sd_ctx->sd->get_latent_channel());
+        if (!audio_latent.empty()) {
+            auto waveform = sd_ctx->sd->decode_ltx_audio_latent(audio_latent);
+            if (!waveform.empty()) {
+                generated_audio = waveform_to_sd_audio(sd_ctx->sd, waveform);
+            } else {
+                LOG_WARN("audio latent decode failed; continuing with silent video");
+            }
+        }
+        int64_t audio_end = ggml_time_ms();
+        LOG_INFO("[Stage] Audio VAE decode end");
+        LOG_INFO("decoding audio latent completed, taking %.2fs", (audio_end - audio_start) * 1.0f / 1000);
+    }
+
+    // Slice video latent (remove audio channels)
+    sd::Tensor<float> video_latent = final_latent;
+    if (sd_version_is_ltxav(sd_ctx->sd->version) &&
+        video_latent.shape()[3] > sd_ctx->sd->get_latent_channel()) {
+        video_latent = sd::ops::slice(video_latent, 3, 0, sd_ctx->sd->get_latent_channel());
+    }
+
+    // Video VAE decode
+    LOG_INFO("[Stage] Video VAE decode begin — latent from disk");
+    int64_t vae_start = ggml_time_ms();
+    sd::Tensor<float> vid = sd_ctx->sd->decode_first_stage(video_latent, true);
+    int64_t vae_end = ggml_time_ms();
+    LOG_INFO("[Stage] Video VAE decode end");
+    LOG_INFO("decode_first_stage completed, taking %.2fs", (vae_end - vae_start) * 1.0f / 1000);
+
+    if (vid.empty()) {
+        LOG_ERROR("sd_decode_video_latent: decode_first_stage failed");
+        free_sd_audio(generated_audio);
+        return false;
+    }
+
+    // Slice to requested frame count if needed
+    if (vid.shape()[2] > 0) {
+        // Use all decoded frames
+    }
+
+    sd_image_t* result_images = (sd_image_t*)calloc(vid.shape()[2], sizeof(sd_image_t));
+    if (result_images == nullptr) {
+        free_sd_audio(generated_audio);
+        return false;
+    }
+    int frame_count = (int)vid.shape()[2];
+    for (int64_t i = 0; i < vid.shape()[2]; i++) {
+        result_images[i] = tensor_to_sd_image(vid, static_cast<int>(i));
+    }
+
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("[Stage] === sd_decode_video_latent end: %d frames decoded ===", frame_count);
+    LOG_INFO("sd_decode_video_latent completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+
+    if (frames_out != nullptr) {
+        *frames_out = result_images;
+    } else {
+        free_sd_images(result_images, frame_count);
+    }
+    if (num_frames_out != nullptr) {
+        *num_frames_out = frame_count;
+    }
+    if (audio_out != nullptr) {
+        *audio_out = generated_audio;
+    } else {
+        free_sd_audio(generated_audio);
+    }
+    return true;
+}
+
+// ===========================================================================
+// LoRA Training Support API — Implementation
+// ===========================================================================
+
+// Thread-local cache of the param tensor map, so that name/shape/data calls
+// can share one get_param_tensors call per "session".
+static thread_local std::map<std::string, ggml_tensor*> tl_unet_param_tensors;
+static thread_local bool tl_unet_param_tensors_valid = false;
+
+// Helper: populate (or verify) the thread-local UNet param map.
+static bool ensure_unet_param_tensors(const sd_ctx_t* sd_ctx) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr || sd_ctx->sd->diffusion_model == nullptr) {
+        return false;
+    }
+    if (!tl_unet_param_tensors_valid) {
+        tl_unet_param_tensors.clear();
+        sd_ctx->sd->diffusion_model->get_param_tensors(tl_unet_param_tensors);
+        if (tl_unet_param_tensors.empty()) {
+            return false;
+        }
+        tl_unet_param_tensors_valid = true;
+    }
+    return true;
+}
+
+// Helper: dequantize a ggml_tensor to F32 into the caller's buffer.
+// Handles F32 (direct copy), F16/BF16 (row conversion), and all quantized types
+// (via a ggml compute graph with ggml_cpy type-cast).
+static int64_t dequantize_tensor_to_f32(ggml_tensor* tensor,
+                                         float* out_buffer,
+                                         int64_t buffer_size) {
+    if (tensor == nullptr || out_buffer == nullptr) {
+        return 0;
+    }
+
+    int64_t numel = ggml_nelements(tensor);
+    if (numel <= 0 || buffer_size < numel) {
+        return 0;
+    }
+
+    if (tensor->type == GGML_TYPE_F32) {
+        // Direct byte copy
+        size_t nbytes = (size_t)numel * sizeof(float);
+        if (tensor->buffer != nullptr) {
+            ggml_backend_tensor_get(tensor, out_buffer, 0, nbytes);
+        } else if (tensor->data != nullptr) {
+            memcpy(out_buffer, tensor->data, nbytes);
+        } else {
+            return 0;
+        }
+        return numel;
+    }
+
+    if (tensor->type == GGML_TYPE_F16) {
+        size_t raw_bytes = ggml_nbytes(tensor);
+        std::vector<uint8_t> raw(raw_bytes);
+        if (tensor->buffer != nullptr) {
+            ggml_backend_tensor_get(tensor, raw.data(), 0, raw_bytes);
+        } else if (tensor->data != nullptr) {
+            memcpy(raw.data(), tensor->data, raw_bytes);
+        } else {
+            return 0;
+        }
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t*>(raw.data()),
+                              out_buffer, numel);
+        return numel;
+    }
+
+    if (tensor->type == GGML_TYPE_BF16) {
+        size_t raw_bytes = ggml_nbytes(tensor);
+        std::vector<uint8_t> raw(raw_bytes);
+        if (tensor->buffer != nullptr) {
+            ggml_backend_tensor_get(tensor, raw.data(), 0, raw_bytes);
+        } else if (tensor->data != nullptr) {
+            memcpy(raw.data(), tensor->data, raw_bytes);
+        } else {
+            return 0;
+        }
+        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t*>(raw.data()),
+                              out_buffer, numel);
+        return numel;
+    }
+
+    // For all other quantized types, read the raw bytes to host memory,
+    // create a local copy of the source tensor on CPU, then use a ggml
+    // compute graph (ggml_cpy) to dequantize to F32 on the CPU backend.
+    ggml_backend_t backend = sd_backend_cpu_init();
+    if (backend == nullptr) {
+        LOG_ERROR("dequantize: failed to create CPU backend for type cast");
+        return 0;
+    }
+
+    // 1. Read raw source bytes to host
+    size_t raw_bytes = ggml_nbytes(tensor);
+    std::vector<uint8_t> raw_data(raw_bytes);
+    if (tensor->buffer != nullptr) {
+        ggml_backend_tensor_get(tensor, raw_data.data(), 0, raw_bytes);
+    } else if (tensor->data != nullptr) {
+        memcpy(raw_data.data(), tensor->data, raw_bytes);
+    } else {
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    // 2. Create context with src + dst tensors
+    size_t meta_size = ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, false);
+    struct ggml_init_params meta_params = {
+        /*.mem_size   =*/ meta_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context* ctx = ggml_init(meta_params);
+    if (ctx == nullptr) {
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    // 3. Create source tensor (same type/shape, will be filled with raw data)
+    int n_dims = ggml_n_dims(tensor);
+    ggml_tensor* src = ggml_new_tensor(ctx, tensor->type, n_dims, tensor->ne);
+    ggml_set_input(src);
+    ggml_set_name(src, "dequant_src");
+
+    // 4. Create destination F32 tensor
+    ggml_tensor* dst = ggml_new_tensor(ctx, GGML_TYPE_F32, n_dims, tensor->ne);
+    ggml_set_output(dst);
+    ggml_set_name(dst, "dequant_dst");
+
+    // 5. Build the graph: ggml_cpy(src, dst) performs type conversion
+    ggml_cgraph* gf = ggml_new_graph(ctx);
+    ggml_tensor* result = ggml_cpy(ctx, src, dst);
+    ggml_build_forward_expand(gf, result);
+
+    // 6. Allocate graph on the CPU backend
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(backend);
+    ggml_gallocr_t galloc = ggml_gallocr_new(cpu_buft);
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        LOG_ERROR("dequantize: failed to allocate graph");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    // 7. Copy raw data into the allocated src tensor
+    ggml_backend_tensor_set(src, raw_data.data(), 0, raw_bytes);
+
+    // 8. Execute
+    enum ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("dequantize: graph compute failed (status=%d)", (int)status);
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return 0;
+    }
+
+    // 9. Read the result from dst
+    size_t out_bytes = (size_t)numel * sizeof(float);
+    ggml_backend_tensor_get(dst, out_buffer, 0, out_bytes);
+
+    // 10. Cleanup
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    return numel;
+}
+
+SD_API int sd_get_unet_param_count(const sd_ctx_t* sd_ctx) {
+    if (!ensure_unet_param_tensors(sd_ctx)) {
+        return 0;
+    }
+    return (int)tl_unet_param_tensors.size();
+}
+
+SD_API size_t sd_get_unet_param_name(const sd_ctx_t* sd_ctx, int index,
+                                      char* buffer, size_t buffer_size) {
+    if (!ensure_unet_param_tensors(sd_ctx)) {
+        return 0;
+    }
+    if (index < 0 || index >= (int)tl_unet_param_tensors.size()) {
+        return 0;
+    }
+    auto it = tl_unet_param_tensors.begin();
+    std::advance(it, index);
+    const std::string& name = it->first;
+    size_t required = name.size();  // excluding null terminator
+    if (buffer == nullptr || buffer_size == 0) {
+        return required;
+    }
+    if (buffer_size <= required) {
+        // Truncate
+        size_t copy_len = buffer_size - 1;
+        memcpy(buffer, name.c_str(), copy_len);
+        buffer[copy_len] = '\0';
+        return required;
+    }
+    memcpy(buffer, name.c_str(), required);
+    buffer[required] = '\0';
+    return required;
+}
+
+SD_API int sd_get_unet_param_shape(const sd_ctx_t* sd_ctx, int index,
+                                    int64_t dims_out[4]) {
+    if (!ensure_unet_param_tensors(sd_ctx)) {
+        return 0;
+    }
+    if (index < 0 || index >= (int)tl_unet_param_tensors.size()) {
+        return 0;
+    }
+    auto it = tl_unet_param_tensors.begin();
+    std::advance(it, index);
+    ggml_tensor* t = it->second;
+    if (t == nullptr) {
+        return 0;
+    }
+    int n_dims = ggml_n_dims(t);
+    for (int i = 0; i < 4; ++i) {
+        dims_out[i] = (i < n_dims) ? t->ne[i] : 1;
+    }
+    return n_dims;
+}
+
+SD_API int64_t sd_get_unet_param_numel(const sd_ctx_t* sd_ctx, int index) {
+    if (!ensure_unet_param_tensors(sd_ctx)) {
+        return 0;
+    }
+    if (index < 0 || index >= (int)tl_unet_param_tensors.size()) {
+        return 0;
+    }
+    auto it = tl_unet_param_tensors.begin();
+    std::advance(it, index);
+    ggml_tensor* t = it->second;
+    if (t == nullptr) {
+        return 0;
+    }
+    return ggml_nelements(t);
+}
+
+SD_API int64_t sd_get_unet_param_data(const sd_ctx_t* sd_ctx, int index,
+                                       float* out_buffer, int64_t buffer_size) {
+    if (!ensure_unet_param_tensors(sd_ctx)) {
+        return 0;
+    }
+    if (index < 0 || index >= (int)tl_unet_param_tensors.size()) {
+        return 0;
+    }
+    auto it = tl_unet_param_tensors.begin();
+    std::advance(it, index);
+    ggml_tensor* t = it->second;
+    if (t == nullptr || out_buffer == nullptr || buffer_size <= 0) {
+        return 0;
+    }
+    return dequantize_tensor_to_f32(t, out_buffer, buffer_size);
+}
+
+SD_API int64_t sd_vae_encode(const sd_ctx_t* sd_ctx,
+                              const float* image_data,
+                              int width, int height,
+                              float* out_latent, int64_t buffer_size) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr ||
+        sd_ctx->sd->first_stage_model == nullptr ||
+        image_data == nullptr || out_latent == nullptr ||
+        width <= 0 || height <= 0) {
+        return 0;
+    }
+
+    // Build sd::Tensor<float> in the layout used by sd_image_to_tensor: [W, H, C, 1]
+    // The caller provides [H * W * 3] floats in [0,1] range, row-major (H, W, C).
+    const int channels = 3;
+    sd::Tensor<float> image({(int64_t)width, (int64_t)height, (int64_t)channels, 1});
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            for (int c = 0; c < channels; ++c) {
+                image.index(x, y, c, 0) = image_data[(y * width + x) * channels + c];
+            }
+        }
+    }
+
+    // Use encode_first_stage which applies vae_output_to_latents + vae_to_diffusion_latents
+    // (i.e. scales by 0.18215 for SD1.x). This gives the latent that the UNet trains on.
+    sd::Tensor<float> latent = sd_ctx->sd->encode_first_stage(image);
+    if (latent.empty()) {
+        LOG_ERROR("sd_vae_encode: encode_first_stage returned empty");
+        return 0;
+    }
+
+    int64_t numel = latent.numel();
+    if (buffer_size < numel) {
+        LOG_ERROR("sd_vae_encode: output buffer too small (%lld < %lld)",
+                  (long long)buffer_size, (long long)numel);
+        return 0;
+    }
+
+    memcpy(out_latent, latent.data(), (size_t)numel * sizeof(float));
+    return numel;
+}
+
+SD_API bool sd_text_encode(const sd_ctx_t* sd_ctx,
+                            const char* text,
+                            int clip_skip,
+                            float* out_crossattn, int64_t* out_crossattn_size,
+                            float* out_vector, int64_t* out_vector_size) {
+    if (sd_ctx == nullptr || sd_ctx->sd == nullptr ||
+        sd_ctx->sd->cond_stage_model == nullptr || text == nullptr) {
+        return false;
+    }
+
+    ConditionerParams params;
+    params.text = text;
+    params.clip_skip = clip_skip;
+
+    // Ensure the conditioner runner is properly set up
+    ConditionerRunnerDoneOnExit runner_done{sd_ctx->sd->cond_stage_model.get()};
+
+    SDCondition cond = sd_ctx->sd->cond_stage_model->get_learned_condition(
+        sd_ctx->sd->n_threads, params);
+
+    if (cond.empty()) {
+        LOG_ERROR("sd_text_encode: get_learned_condition returned empty");
+        if (out_crossattn_size) *out_crossattn_size = 0;
+        if (out_vector_size) *out_vector_size = 0;
+        return false;
+    }
+
+    // Copy c_crossattn
+    if (out_crossattn != nullptr && out_crossattn_size != nullptr) {
+        int64_t numel = cond.c_crossattn.numel();
+        int64_t cap = *out_crossattn_size;
+        if (numel > 0 && cap >= numel) {
+            memcpy(out_crossattn, cond.c_crossattn.data(), (size_t)numel * sizeof(float));
+            *out_crossattn_size = numel;
+        } else if (numel > 0) {
+            LOG_WARN("sd_text_encode: crossattn buffer too small (%lld < %lld), truncated",
+                     (long long)cap, (long long)numel);
+            *out_crossattn_size = 0;
+        } else {
+            *out_crossattn_size = 0;
+        }
+    }
+
+    // Copy c_vector (pooled output — may be empty for SD1.x)
+    if (out_vector != nullptr && out_vector_size != nullptr) {
+        int64_t numel = cond.c_vector.numel();
+        int64_t cap = *out_vector_size;
+        if (numel > 0 && cap >= numel) {
+            memcpy(out_vector, cond.c_vector.data(), (size_t)numel * sizeof(float));
+            *out_vector_size = numel;
+        } else if (numel > 0) {
+            LOG_WARN("sd_text_encode: vector buffer too small (%lld < %lld), truncated",
+                     (long long)cap, (long long)numel);
+            *out_vector_size = 0;
+        } else {
+            *out_vector_size = 0;
+        }
+    }
+
+    return true;
 }

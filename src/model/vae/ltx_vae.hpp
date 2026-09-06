@@ -1303,6 +1303,40 @@ struct LTXVideoVAE : public VAE {
         plan.stride          = std::max(1, plan.frames - plan.overlap);
         int64_t tiled_frames = std::max<int64_t>(1, total_frames - plan.overlap);
         plan.num_tiles       = total_frames > 0 ? static_cast<int>((tiled_frames + plan.stride - 1) / plan.stride) : 0;
+
+        // If the configured window covers the entire latent sequence, tiling
+        // degrades to a single full decode and provides no memory reduction
+        // (observed: 3 latent frames + window 4 -> 1 tile -> compute buffer OOM
+        // during the VAE decode retry).  Shrink the window to the largest size
+        // that still yields >= 2 tiles so peak activation memory drops.
+        if (total_frames > 1 && plan.num_tiles < 2) {
+            int best_frames  = plan.frames;
+            int best_overlap = plan.overlap;
+            for (int64_t f = plan.frames; f >= 1; --f) {
+                int64_t ov     = std::min<int64_t>(plan.overlap, f - 1);
+                int64_t stride = std::max<int64_t>(1, f - ov);
+                int64_t tf     = std::max<int64_t>(1, total_frames - ov);
+                int64_t nt     = (tf + stride - 1) / stride;
+                if (nt >= 2) {
+                    best_frames  = static_cast<int>(f);
+                    best_overlap = static_cast<int>(ov);
+                    break;
+                }
+            }
+            LOG_WARN("temporal tile window (%d frames, overlap %d) covers all %lld latent frames; "
+                     "shrinking to %d frames (overlap %d) so tiling reduces peak memory",
+                     plan.frames,
+                     plan.overlap,
+                     (long long)total_frames,
+                     best_frames,
+                     best_overlap);
+            plan.frames  = best_frames;
+            plan.overlap = best_overlap;
+            plan.stride  = std::max(1, plan.frames - plan.overlap);
+            tiled_frames = std::max<int64_t>(1, total_frames - plan.overlap);
+            plan.num_tiles = static_cast<int>((tiled_frames + plan.stride - 1) / plan.stride);
+        }
+
         return plan;
     }
 

@@ -875,18 +875,16 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.llm_vision_path                 = llm_vision_path.c_str();
     sd_ctx_params.diffusion_model_path            = diffusion_model_path.c_str();
     sd_ctx_params.high_noise_diffusion_model_path = high_noise_diffusion_model_path.c_str();
-    sd_ctx_params.uncond_diffusion_model_path     = uncond_diffusion_model_path.c_str();
-    sd_ctx_params.embeddings_connectors_path      = embeddings_connectors_path.c_str();
+    // Removed fields (ABI compat with SD.NET 7.0.0): uncond_diffusion_model_path, embeddings_connectors_path,
+    //   audio_vae_path, ip_adapter_path, motion_module_path, pulid_weights_path
     sd_ctx_params.vae_path                        = vae_path.c_str();
-    sd_ctx_params.audio_vae_path                  = audio_vae_path.c_str();
     sd_ctx_params.taesd_path                      = taesd_path.c_str();
     sd_ctx_params.control_net_path                = control_net_path.c_str();
-    sd_ctx_params.ip_adapter_path                 = ip_adapter_path.c_str();
-    sd_ctx_params.motion_module_path              = motion_module_path.c_str();
+    // Removed: ip_adapter_path, motion_module_path, pulid_weights_path
     sd_ctx_params.embeddings                      = embedding_vec.data();
     sd_ctx_params.embedding_count                 = static_cast<uint32_t>(embedding_vec.size());
     sd_ctx_params.photo_maker_path                = photo_maker_path.c_str();
-    sd_ctx_params.pulid_weights_path              = pulid_weights_path.c_str();
+    // Removed: pulid_weights_path
     sd_ctx_params.tensor_type_rules               = tensor_type_rules.c_str();
     sd_ctx_params.n_threads                       = n_threads;
     sd_ctx_params.wtype                           = wtype;
@@ -901,16 +899,13 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.diffusion_conv_direct           = diffusion_conv_direct;
     sd_ctx_params.vae_conv_direct                 = vae_conv_direct;
     sd_ctx_params.force_sdxl_vae_conv_scale       = force_sdxl_vae_conv_scale;
-    sd_ctx_params.vae_format                      = str_to_vae_format(vae_format);
-    sd_ctx_params.max_vram                        = max_vram.c_str();
-    sd_ctx_params.stream_layers                   = stream_layers;
-    sd_ctx_params.eager_load                      = eager_load;
-    sd_ctx_params.backend                         = effective_backend.c_str();
-    sd_ctx_params.params_backend                  = effective_params_backend.c_str();
-    sd_ctx_params.split_mode                      = split_mode.c_str();
-    sd_ctx_params.auto_fit                        = auto_fit;
-    sd_ctx_params.rpc_servers                     = rpc_servers.c_str();
-    sd_ctx_params.model_args                      = model_args.empty() ? nullptr : model_args.c_str();
+    // Removed: vae_format, stream_layers, eager_load, backend, params_backend, split_mode, auto_fit, rpc_servers, model_args
+    // max_vram is now float (was const char*); parse string to float
+    try {
+        sd_ctx_params.max_vram = max_vram.empty() ? 0.f : std::stof(max_vram);
+    } catch (...) {
+        sd_ctx_params.max_vram = 0.f;
+    }
     return sd_ctx_params;
 }
 

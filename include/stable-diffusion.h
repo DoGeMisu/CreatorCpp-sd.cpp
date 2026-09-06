@@ -185,52 +185,56 @@ enum sd_vae_format_t {
     SD_VAE_FORMAT_COUNT,
 };
 
+// ============================================================================
+// ABI-compatible struct layout for StableDiffusion.NET 7.0.0 (42 fields).
+// DO NOT reorder — the field order must exactly match what SD.NET P/Invoke
+// marshals.  See the comparison table in docs/abi-compat.md for details.
+// Field names that exist in upstream sd.cpp master but NOT in SD.NET 7.0.0
+// are omitted here; the C++ source uses hardcoded defaults for those.
+// ============================================================================
 typedef struct {
-    const char* model_path;
-    const char* clip_l_path;
-    const char* clip_g_path;
-    const char* clip_vision_path;
-    const char* t5xxl_path;
-    const char* llm_path;
-    const char* llm_vision_path;
-    const char* diffusion_model_path;
-    const char* high_noise_diffusion_model_path;
-    const char* uncond_diffusion_model_path;
-    const char* embeddings_connectors_path;
-    const char* vae_path;
-    const char* audio_vae_path;
-    const char* taesd_path;
-    const char* control_net_path;
-    const char* ip_adapter_path;
-    const char* motion_module_path;
-    const sd_embedding_t* embeddings;
-    uint32_t embedding_count;
-    const char* photo_maker_path;
-    const char* pulid_weights_path;
-    const char* tensor_type_rules;
-    int n_threads;
-    enum sd_type_t wtype;
-    enum rng_type_t rng_type;
-    enum rng_type_t sampler_rng_type;
-    enum prediction_t prediction;
-    enum lora_apply_mode_t lora_apply_mode;
-    bool enable_mmap;
-    bool flash_attn;
-    bool diffusion_flash_attn;
-    bool tae_preview_only;
-    bool diffusion_conv_direct;
-    bool vae_conv_direct;
-    bool force_sdxl_vae_conv_scale;
-    enum sd_vae_format_t vae_format;
-    const char* max_vram;  // GiB budget or backend assignment spec for graph-cut segmented param offload (0 = disabled, -1 = auto)
-    bool stream_layers;  // Enable residency+prefetch streaming on top of --max-vram (no effect without --max-vram)
-    bool eager_load;  // Load all params into the params backend at model-load time instead of lazily on first use
-    const char* backend;
-    const char* params_backend;
-    const char* split_mode;  // weight distribution for multi-device modules: layer (default) or row, or per-module assignments e.g. "diffusion=row"
-    bool auto_fit;
-    const char* rpc_servers;
-    const char* model_args;
+    const char* model_path;                       // 1
+    const char* clip_l_path;                      // 2
+    const char* clip_g_path;                      // 3
+    const char* clip_vision_path;                 // 4
+    const char* t5xxl_path;                       // 5
+    const char* llm_path;                         // 6
+    const char* llm_vision_path;                  // 7
+    const char* diffusion_model_path;             // 8
+    const char* high_noise_diffusion_model_path;  // 9
+    const char* vae_path;                         // 10
+    const char* taesd_path;                       // 11
+    const char* control_net_path;                 // 12
+    const sd_embedding_t* embeddings;             // 13
+    uint32_t embedding_count;                     // 14
+    const char* photo_maker_path;                 // 15
+    const char* tensor_type_rules;                // 16
+    bool vae_decode_only;                         // 17  (SD.NET only; unused by C++ core)
+    bool free_params_immediately;                 // 18  (SD.NET only; unused by C++ core)
+    int n_threads;                                // 19
+    enum sd_type_t wtype;                         // 20
+    enum rng_type_t rng_type;                     // 21
+    enum rng_type_t sampler_rng_type;             // 22
+    enum prediction_t prediction;                 // 23
+    enum lora_apply_mode_t lora_apply_mode;       // 24
+    bool offload_params_to_cpu;                   // 25  (SD.NET only; unused by C++ core)
+    bool enable_mmap;                             // 26
+    bool keep_clip_on_cpu;                        // 27  (SD.NET only; unused by C++ core)
+    bool keep_control_net_on_cpu;                 // 28  (SD.NET only; unused by C++ core)
+    bool keep_vae_on_cpu;                         // 29  (SD.NET only; unused by C++ core)
+    bool flash_attn;                              // 30
+    bool diffusion_flash_attn;                    // 31
+    bool tae_preview_only;                        // 32
+    bool diffusion_conv_direct;                   // 33
+    bool vae_conv_direct;                         // 34
+    bool circular_x;                              // 35  (SD.NET only; C++ core uses gen params)
+    bool circular_y;                              // 36  (SD.NET only; C++ core uses gen params)
+    bool force_sdxl_vae_conv_scale;               // 37
+    bool chroma_use_dit_mask;                     // 38  (SD.NET only; unused by C++ core)
+    bool chroma_use_t5_mask;                      // 39  (SD.NET only; unused by C++ core)
+    int chroma_t5_mask_pad;                       // 40  (SD.NET only; unused by C++ core)
+    bool qwen_image_zero_cond_t;                  // 41  (SD.NET only; unused by C++ core)
+    float max_vram;                               // 42  (GiB budget, 0=disabled, -1=auto)
 } sd_ctx_params_t;
 
 typedef struct {
@@ -451,6 +455,10 @@ SD_API bool sd_ctx_load_control_net(sd_ctx_t* sd_ctx, const char* path);
 SD_API bool sd_ctx_unload_control_net(sd_ctx_t* sd_ctx);
 SD_API bool sd_ctx_has_control_net(const sd_ctx_t* sd_ctx);
 
+// Set ControlNet weight type override for subsequent sd_ctx_load_control_net calls.
+// Pass SD_TYPE_COUNT to disable override (use original tensor types).
+SD_API void sd_ctx_set_control_net_wtype(sd_ctx_t* sd_ctx, enum sd_type_t wtype);
+
 SD_API const char* sd_type_name(enum sd_type_t type);
 SD_API enum sd_type_t str_to_sd_type(const char* str);
 SD_API const char* sd_rng_type_name(enum rng_type_t rng_type);
@@ -508,6 +516,147 @@ SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            sd_image_t** frames_out,
                            int* num_frames_out,
                            sd_audio_t** audio_out);
+
+// ===========================================================================
+// Two-phase video generation support (memory-light mode)
+//
+// Phase 1 (sd_encode_video_prompt): load ONLY the text encoder for the chosen
+// video model architecture (e.g. Gemma-3-12B LLM + embeddings connectors for
+// LTX-2.3, T5 XXL for Wan2.x, MLLM for HunyuanVideo), encode the prompt into
+// a conditioning embedding, serialize it to disk, then release ALL text-encoder
+// memory. Returns true on success.
+//
+// Phase 2 (sd_ctx_set_precomputed_embeddings + generate_video): load ONLY the
+// diffusion model + VAE (no text encoder). generate_video() then reads the
+// precomputed conditioning embeddings from disk and skips the text-encoder
+// pass entirely.
+//
+// This keeps the large text encoder and the diffusion model from being
+// resident at the same time, which is essential on 8GB-VRAM machines.
+// ===========================================================================
+
+// Text encoder architectures supported by the two-phase pipeline.
+enum sd_video_encoder_type_t {
+    SD_VIDEO_ENCODER_LTX2 = 0,  // LTX-2.3: Gemma-3-12B LLM + embeddings connectors
+    SD_VIDEO_ENCODER_WAN,       // Wan2.x: T5 XXL
+    SD_VIDEO_ENCODER_HUNYUAN,   // HunyuanVideo: MLLM (text encoder)
+    SD_VIDEO_ENCODER_MINIMAX,   // MiniMax-H3: LLM text encoder
+    SD_VIDEO_ENCODER_COUNT
+};
+
+// Phase 1 (generic): Encode a prompt to a conditioning embedding file.
+//   encoder_type:  which text-encoder architecture to use (see enum above).
+//   te_path:       text encoder model path (Gemma LLM for LTX2, T5 XXL for Wan,
+//                  MLLM for HunyuanVideo/MiniMax-H3).
+//   te_extra_path: extra weights required by the encoder (LTX-2.3 embeddings
+//                  connectors; may be NULL for models that do not need it).
+//   prompt / negative_prompt: the conditioning texts (negative_prompt may be NULL).
+//   n_threads:     number of CPU threads for the encoder.
+//   cond_out_path / uncond_out_path: output files (raw float32 blobs, "LTXE" header).
+// The embedding files are raw float32 blobs with an "LTXE" header.
+SD_API bool sd_encode_video_prompt(enum sd_video_encoder_type_t encoder_type,
+                                   const char* te_path,
+                                   const char* te_extra_path,
+                                   const char* prompt,
+                                   const char* negative_prompt,
+                                   int n_threads,
+                                   const char* cond_out_path,
+                                   const char* uncond_out_path);
+
+// Phase 1 (LTX-2.3 convenience wrapper; equivalent to
+// sd_encode_video_prompt(SD_VIDEO_ENCODER_LTX2, ...)).
+SD_API bool sd_encode_ltxav_prompt(const char* llm_path,
+                                   const char* embeddings_connectors_path,
+                                   const char* prompt,
+                                   const char* negative_prompt,
+                                   int n_threads,
+                                   const char* cond_out_path,
+                                   const char* uncond_out_path);
+
+// Phase 2: Tell a generation context to use precomputed embeddings produced by
+// sd_encode_video_prompt()/sd_encode_ltxav_prompt(). After this call,
+// generate_video() skips the text encoder and reads the conditioning directly
+// from disk. The context must be created WITHOUT a text encoder path
+// (diffusion model + VAE only). Returns true on success.
+SD_API bool sd_ctx_set_precomputed_embeddings(sd_ctx_t* sd_ctx,
+                                              const char* cond_embedding_path,
+                                              const char* uncond_embedding_path);
+
+// ===========================================================================
+// Three-phase video generation support (maximum VRAM efficiency)
+//
+// Phase 1 (sd_encode_video_prompt): Text encoder only — encode, save, release.
+// Phase 2 (generate_video with decode_only skip): Diffusion only — sample,
+//        save latent, release. VAE weights are NOT loaded, giving Diffusion
+//        exclusive access to all available VRAM.
+// Phase 3 (sd_decode_video_latent): VAE only — load VAE, decode latent, release.
+//
+// This prevents the VAE (~1.7 GB for LTX-2.3) from occupying VRAM during the
+// diffusion sampling loop, which on 8 GB GPUs reduces graph-cut segments and
+// eliminates redundant RAM→VRAM weight staging.
+// ===========================================================================
+
+// Phase 2 flag: Tell a diffusion context to skip VAE decode in generate_video().
+// After generate_video() returns, use sd_save_video_latent() to persist the
+// raw latent tensor to disk, then free the diffusion context.
+// The context must be created with new_video_diffusion_ctx().
+// Returns true on success.
+SD_API bool sd_ctx_set_decode_only(sd_ctx_t* sd_ctx, bool decode_only);
+
+// Phase 2: Create a diffusion-only context (no VAE, no text encoder).
+//   diffusion_model_path: diffusion model file (e.g. ltx-2.3-22b.gguf).
+//   n_threads:           CPU thread count.
+//   max_vram:           max VRAM in GiB (0 = auto-detect).
+//   flash_attn:         enable flash attention in diffusion model.
+// Returns NULL on failure.
+// Use sd_ctx_set_precomputed_embeddings() to inject TE embeddings,
+// then call generate_video() with sd_ctx_set_decode_only(true) to
+// sample and cache the latent without VAE decode.
+SD_API sd_ctx_t* new_video_diffusion_ctx(const char* diffusion_model_path,
+                                          int n_threads,
+                                          int max_vram,
+                                          bool flash_attn);
+
+// Phase 2 output: Serialize the final latent produced by generate_video()
+// to a .bin file (raw float32, header = "SDLT" + 4×int64 shape).
+// Must be called immediately after generate_video() returns true and before
+// free_sd_ctx(). Returns true on success.
+SD_API bool sd_save_video_latent(sd_ctx_t* sd_ctx, const char* latent_out_path);
+
+// Phase 3: Create a VAE-only context (no diffusion model, no text encoder).
+//   vae_path:        video VAE model file.
+//   audio_vae_path:  audio VAE model file (may be NULL to skip audio).
+//   n_threads:       CPU thread count.
+//   max_vram:        max VRAM in GiB (0 = auto-detect).
+// Returns NULL on failure.
+SD_API sd_ctx_t* new_video_vae_ctx(const char* vae_path,
+                                    const char* audio_vae_path,
+                                    int n_threads,
+                                    int max_vram);
+
+// Phase 3: Decode a latent file (produced by sd_save_video_latent) into video
+// frames + optional audio. The latent is loaded from disk, decoded by the VAE
+// context, and returned as sd_image_t frames.
+//   sd_ctx:          VAE-only context from new_video_vae_ctx().
+//   latent_path:     path to .bin file from sd_save_video_latent().
+//   width/height:     target video resolution (must match the original request).
+//   vae_scale_factor: typically 8 for LTX (use sd_ctx->sd->get_vae_scale_factor()).
+//   audio_length:     audio latent length (0 if no audio).
+//   fps:              frame rate (used for audio alignment).
+//   frames_out:       output frame array (caller frees with free_sd_images).
+//   num_frames_out:  output frame count.
+//   audio_out:        output audio (may be NULL; caller frees with free_sd_audio).
+// Returns true on success.
+SD_API bool sd_decode_video_latent(sd_ctx_t* sd_ctx,
+                                    const char* latent_path,
+                                    int width,
+                                    int height,
+                                    int vae_scale_factor,
+                                    int audio_length,
+                                    float fps,
+                                    sd_image_t** frames_out,
+                                    int* num_frames_out,
+                                    sd_audio_t** audio_out);
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 
@@ -591,6 +740,70 @@ SD_API size_t sd_list_devices(char* buffer, size_t buffer_size);
 // for C API, caller needs to call free_sd_images to free the memory after use
 // This helps avoid CRT problems on Windows when memory is allocated in the library but freed in the caller, which may use a different CRT.
 SD_API void free_sd_images(sd_image_t* result_images, int num_images);
+
+// ===========================================================================
+// LoRA Training Support API
+// These functions expose internal model components for external LoRA training
+// libraries (e.g. sd_train.dll). They allow:
+//   1. Extracting UNet weight tensors as F32 buffers
+//   2. Encoding images to VAE latents
+//   3. Encoding text prompts to CLIP/T5 conditioning embeddings
+// ===========================================================================
+
+// --- UNet weight extraction ---
+// Get the number of named parameter tensors in the UNet (diffusion model).
+// Returns 0 if the context is invalid or the model is not loaded.
+SD_API int sd_get_unet_param_count(const sd_ctx_t* sd_ctx);
+
+// Get the name of the i-th UNet parameter tensor.
+// Returns NULL on invalid index. The returned pointer is owned by the context
+// and remains valid until the next call. Pass buffer/buffer_size to receive
+// a copy; if buffer is NULL or buffer_size is 0, only the required length is
+// returned (excluding null terminator).
+SD_API size_t sd_get_unet_param_name(const sd_ctx_t* sd_ctx, int index,
+                                      char* buffer, size_t buffer_size);
+
+// Get the shape of the i-th UNet parameter tensor.
+// Writes up to 4 dims into dims_out and returns the number of dims, or 0 on error.
+SD_API int sd_get_unet_param_shape(const sd_ctx_t* sd_ctx, int index,
+                                    int64_t dims_out[4]);
+
+// Copy the i-th UNet parameter tensor data as F32 into the caller's buffer.
+// The buffer must hold at least sd_get_unet_param_count_floats(...) floats.
+// Returns the number of floats copied, or 0 on error.
+// Note: quantized tensors are dequantized to F32 on the fly.
+SD_API int64_t sd_get_unet_param_data(const sd_ctx_t* sd_ctx, int index,
+                                       float* out_buffer, int64_t buffer_size);
+
+// Convenience: get the number of floats in the i-th tensor (= product of dims).
+SD_API int64_t sd_get_unet_param_numel(const sd_ctx_t* sd_ctx, int index);
+
+// --- VAE encode ---
+// Encode an image to VAE latent space.
+// image_data: RGB pixel data, [H * W * 3] floats in [0, 1] range.
+// width, height: image dimensions (must be multiples of 8).
+// out_latent: caller-provided buffer for the latent output.
+//   Latent shape is [C=4, H/8, W/8] for SD 1.x, so buffer_size = 4 * (H/8) * (W/8).
+// Returns the number of floats written, or 0 on error.
+SD_API int64_t sd_vae_encode(const sd_ctx_t* sd_ctx,
+                              const float* image_data,
+                              int width, int height,
+                              float* out_latent, int64_t buffer_size);
+
+// --- Text encode (CLIP/T5) ---
+// Encode a text prompt to conditioning embeddings.
+// text: null-terminated prompt string.
+// clip_skip: number of CLIP layers to skip (-1 = no skip).
+// out_crossattn: buffer for c_crossattn embeddings (context for cross-attention).
+// out_crossattn_size: [in] buffer capacity in floats, [out] actual floats written.
+// out_vector: buffer for c_vector embeddings (pooled output, may be NULL).
+// out_vector_size: [in] buffer capacity, [out] actual floats written.
+// Returns true on success.
+SD_API bool sd_text_encode(const sd_ctx_t* sd_ctx,
+                            const char* text,
+                            int clip_skip,
+                            float* out_crossattn, int64_t* out_crossattn_size,
+                            float* out_vector, int64_t* out_vector_size);
 
 #ifdef __cplusplus
 }

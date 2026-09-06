@@ -204,22 +204,21 @@ namespace LLM {
                     if (contains(name, "attn.q_proj")) {
                         config.llama_cpp_style = true;
                     }
-                    if (contains(name, "visual.patch_embed.proj.1.weight")) {
+                    if (ends_with(name, "visual.patch_embed.proj.1.weight")) {
                         config.vision.split_patch_embed = true;
                     }
-                    if (contains(name, "visual.patch_embed.proj.0.weight")) {
+                    if (ends_with(name, "visual.patch_embed.proj.0.weight")) {
                         config.vision.patch_size  = static_cast<int>(tensor_storage.ne[0]);
                         config.vision.in_channels = tensor_storage.ne[2];
                         config.vision.hidden_size = tensor_storage.ne[3];
                     }
-                    // HF-format checkpoints keep the patch embed unsplit under a single name.
-                    if (contains(name, "visual.patch_embed.proj.weight")) {
+                    if (ends_with(name, "visual.patch_embed.proj.weight")) {
                         config.vision.patch_size = static_cast<int>(tensor_storage.ne[0]);
                     }
                     if (contains(name, "visual.patch_embed.bias") || contains(name, "visual.patch_embed.proj.bias")) {
                         config.vision.hidden_size = tensor_storage.ne[0];
                     }
-                    if (contains(name, "visual.pos_embed.weight")) {
+                    if (ends_with(name, "visual.pos_embed.weight")) {
                         config.vision.hidden_size             = tensor_storage.ne[0];
                         config.vision.num_position_embeddings = static_cast<int>(tensor_storage.ne[1]);
                     }
@@ -232,12 +231,12 @@ namespace LLM {
                             }
                         }
                     }
-                    if (contains(name, "visual.blocks.0.mlp.linear_fc1.weight") ||
-                        contains(name, "visual.blocks.0.mlp.gate_proj.weight")) {
+                    if (ends_with(name, "visual.blocks.0.mlp.linear_fc1.weight") ||
+                        ends_with(name, "visual.blocks.0.mlp.gate_proj.weight")) {
                         config.vision.intermediate_size = tensor_storage.ne[1];
                     }
-                    if (contains(name, "visual.merger.linear_fc2.weight") ||
-                        contains(name, "visual.merger.mlp.2.weight")) {
+                    if (ends_with(name, "visual.merger.linear_fc2.weight") ||
+                        ends_with(name, "visual.merger.mlp.2.weight")) {
                         config.vision.out_hidden_size = tensor_storage.ne[1];
                     }
                     continue;
@@ -252,17 +251,17 @@ namespace LLM {
                         }
                     }
                 }
-                if (contains(name, "embed_tokens.weight")) {
+                if (ends_with(name, "embed_tokens.weight")) {
                     config.hidden_size = tensor_storage.ne[0];
                     config.vocab_size  = tensor_storage.ne[1];
                 }
-                if (contains(name, "layers.0.mlp.gate_proj.weight")) {
+                if (ends_with(name, "layers.0.mlp.gate_proj.weight")) {
                     config.intermediate_size = tensor_storage.ne[1];
                 }
-                if (contains(name, "layers.0.mlp.experts.gate_up_proj.weight")) {
+                if (ends_with(name, "layers.0.mlp.experts.gate_up_proj.weight")) {
                     config.intermediate_size = tensor_storage.ne[1] / 2;
                 }
-                if (contains(name, "layers.0.mlp.experts.gate_proj.weight")) {
+                if (ends_with(name, "layers.0.mlp.experts.gate_proj.weight")) {
                     config.intermediate_size = tensor_storage.ne[1];
                 }
             }

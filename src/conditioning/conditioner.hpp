@@ -2986,17 +2986,38 @@ struct LTXAVEmbedder : public Conditioner {
                   const std::string& projector_prefix                 = "text_embedding_projection",
                   std::shared_ptr<RunnerWeightManager> weight_manager = nullptr) {
         tokenizer       = std::make_shared<GemmaTokenizer>();
+        // Log how many tensors match the llm prefix for debugging
+        int llm_match_count = 0;
+        int proj_match_count = 0;
+        for (const auto& [name, _] : tensor_storage_map) {
+            if (name.rfind(llm_prefix + ".", 0) == 0) llm_match_count++;
+            if (name.rfind(projector_prefix + ".", 0) == 0) proj_match_count++;
+        }
+        LOG_INFO("LTXAVEmbedder: llm_prefix='%s' matched %d tensors, projector_prefix='%s' matched %d tensors",
+                 llm_prefix.c_str(), llm_match_count, projector_prefix.c_str(), proj_match_count);
         llm             = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::GEMMA3_12B,
                                                backend,
                                                tensor_storage_map,
                                                llm_prefix,
                                                false,
                                                weight_manager);
+        // Log detected LLM config for debugging 0xC0000094 crashes
+        {
+            const auto& cfg = llm->config;
+            LOG_INFO("LTXAVEmbedder: GEMMA3_12B config: num_layers=%lld, hidden_size=%lld, num_heads=%d, num_kv_heads=%d, head_dim=%d, intermediate_size=%lld, vocab_size=%lld",
+                     (long long)cfg.num_layers, (long long)cfg.hidden_size,
+                     cfg.num_heads, cfg.num_kv_heads, cfg.head_dim,
+                     (long long)cfg.intermediate_size, (long long)cfg.vocab_size);
+            if (cfg.num_heads == 0 || cfg.head_dim == 0 || cfg.num_layers == 0 || cfg.hidden_size == 0) {
+                LOG_ERROR("LTXAVEmbedder: CRITICAL config has zero values - will cause divide-by-zero (0xC0000094)");
+            }
+        }
         dual_projection = tensor_storage_map.find(projector_prefix + ".video_aggregate_embed.weight") != tensor_storage_map.end();
+        LOG_INFO("LTXAVEmbedder: dual_projection=%s", dual_projection ? "true" : "false");
         projector       = std::make_shared<LTXAVTextProjectionRunner>(backend,
-                                                                tensor_storage_map,
-                                                                projector_prefix,
-                                                                weight_manager);
+                                                                 tensor_storage_map,
+                                                                 projector_prefix,
+                                                                 weight_manager);
     }
 
     void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {

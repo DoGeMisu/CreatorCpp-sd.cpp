@@ -19,6 +19,7 @@ struct TensorStorage {
     ggml_type expected_type     = GGML_TYPE_COUNT;
     bool is_f8_e4m3             = false;
     bool is_f8_e5m2             = false;
+    float f8_scale              = 1.0f;  // per-tensor scale factor for F8_E4M3/F8_E5M2 (ComfyUI scaled_fp8)
     bool is_f64                 = false;
     bool is_i64                 = false;
     bool is_int8_tensorwise     = false;

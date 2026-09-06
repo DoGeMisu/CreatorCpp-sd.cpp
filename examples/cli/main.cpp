@@ -585,8 +585,8 @@ static bool apply_adetailer(sd_ctx_t* sd_ctx,
 
     ADetailerCtxPtr ad_ctx(new_adetailer_ctx(gen_params.ad_model_path.c_str(),
                                              ctx_params.n_threads,
-                                             sd_ctx_params.backend,
-                                             sd_ctx_params.params_backend));
+                                             "",  // backend (removed from sd_ctx_params)
+                                             ""));  // params_backend
     if (ad_ctx == nullptr) {
         LOG_ERROR("new_adetailer_ctx failed");
         return false;
@@ -972,8 +972,8 @@ int main(int argc, const char* argv[]) {
                                                      ctx_params.diffusion_conv_direct,
                                                      ctx_params.n_threads,
                                                      gen_params.upscale_tile_size,
-                                                     sd_ctx_params.backend,
-                                                     sd_ctx_params.params_backend));
+                                                     "",  // backend (removed from sd_ctx_params)
+                                                     ""));  // params_backend
 
         if (upscaler_ctx == nullptr) {
             LOG_ERROR("new_upscaler_ctx failed");

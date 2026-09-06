@@ -269,18 +269,33 @@ namespace sd::ggml_graph_cut {
         ggml_backend_dev_memory(dev, &free_vram, &total_vram);
         size_t spare_bytes = static_cast<size_t>(MAX_VRAM_BYTES_PER_GIB * spare_vram);
 
-        if (free_vram <= spare_bytes) {
+        // Dynamic safety margin: proportional to total VRAM, not a fixed 1GB.
+        // This adapts to 4GB / 8GB / 16GB / 24GB / 48GB GPUs without hardcoding.
+        size_t safety_margin;
+        if (total_vram <= 8ull * 1024 * 1024 * 1024) {
+            safety_margin = 512ull * 1024 * 1024;       // 512MB for small GPUs
+        } else if (total_vram <= 24ull * 1024 * 1024 * 1024) {
+            safety_margin = 768ull * 1024 * 1024;       // 768MB for medium GPUs
+        } else {
+            safety_margin = 1024ull * 1024 * 1024;      // 1GB for large GPUs
+        }
+
+        // Use the larger of: dynamic margin or user-specified spare_vram
+        size_t effective_margin = std::max(spare_bytes, safety_margin);
+
+        if (free_vram <= effective_margin) {
             LOG_WARN("--max-vram < 0 requested, but free VRAM is %.2f GiB; reserving %.2f GiB leaves no graph budget",
-                     free_vram / MAX_VRAM_BYTES_PER_GIB, spare_vram);
+                     free_vram / MAX_VRAM_BYTES_PER_GIB,
+                     effective_margin / MAX_VRAM_BYTES_PER_GIB);
             return 0;
         }
 
-        const size_t max_vram_bytes = free_vram - spare_bytes;
-        LOG_INFO("--max-vram < 0 auto-detected %.2f GiB free VRAM (%.2f GiB total), reserving %.2f GiB; using %.2f GiB",
-                 free_vram / MAX_VRAM_BYTES_PER_GIB,
-                 total_vram / MAX_VRAM_BYTES_PER_GIB,
-                 spare_vram,
-                 max_vram_bytes / MAX_VRAM_BYTES_PER_GIB);
+        const size_t max_vram_bytes = free_vram - effective_margin;
+        LOG_INFO("[LTX][VRAM] Total: %.0f MB, Available: %.0f MB, Safe Budget: %.0f MB (margin: %.0f MB)",
+                 total_vram / (1024.0 * 1024.0),
+                 free_vram / (1024.0 * 1024.0),
+                 max_vram_bytes / (1024.0 * 1024.0),
+                 effective_margin / (1024.0 * 1024.0));
         return max_vram_bytes;
     }
 
@@ -980,34 +995,69 @@ namespace sd::ggml_graph_cut {
             return;
         }
 
-        // Leave room for the largest active streamed segment.
-        size_t worst_streamed_footprint = 0;
+        // The largest *non-param* footprint that a streamed segment needs
+        // at runtime: compute buffer + I/O (external, previous-cut, output).
+        // input_param_bytes is excluded because RESIDENT segments hold their
+        // params in VRAM persistently — the param bytes are accounted for
+        // in the cumulative resident total, not in the streamed overhead.
+        size_t worst_streamed_overhead = 0;
         for (const auto& seg : plan.segments) {
-            const size_t seg_footprint = seg.input_param_bytes +
-                                         seg.compute_buffer_size +
-                                         seg.output_bytes +
-                                         seg.input_previous_cut_bytes +
-                                         seg.input_external_bytes;
-            if (seg_footprint > worst_streamed_footprint) {
-                worst_streamed_footprint = seg_footprint;
+            const size_t seg_overhead = seg.compute_buffer_size +
+                                        seg.output_bytes +
+                                        seg.input_previous_cut_bytes +
+                                        seg.input_external_bytes;
+            if (seg_overhead > worst_streamed_overhead) {
+                worst_streamed_overhead = seg_overhead;
             }
         }
-        constexpr size_t safety = 512ull * 1024 * 1024;
-        const size_t reserved   = safety + worst_streamed_footprint;
+
+        // Safety margin: fixed 256 MB floor, plus 32 MB per segment for
+        // compute-buffer fragmentation.  The old formula (64 MB × n_seg)
+        // over-reserved for large segment counts (e.g. 50 × 64 = 3.2 GB)
+        // and prevented any segment from being RESIDENT even when VRAM
+        // was sufficient.
+        size_t safety = std::max<size_t>(256ull * 1024 * 1024,
+                                        plan.segments.size() * 32ull * 1024 * 1024);
+
+        // For a STREAMED segment we also need to stage its params into
+        // VRAM temporarily, so we must reserve room for the largest
+        // single segment's param bytes alongside the compute overhead.
+        size_t worst_streamed_param = 0;
+        for (const auto& seg : plan.segments) {
+            if (seg.input_param_bytes > worst_streamed_param) {
+                worst_streamed_param = seg.input_param_bytes;
+            }
+        }
+        const size_t reserved = safety + worst_streamed_overhead + worst_streamed_param;
 
         if (max_graph_vram_bytes <= reserved) {
+            LOG_INFO("[LTX][Placement] Not enough VRAM for RESIDENT segments: budget=%.0f MB, reserved=%.0f MB (safety=%.0f MB, overhead=%.0f MB, param=%.0f MB)",
+                     max_graph_vram_bytes / (1024.0 * 1024.0),
+                     reserved / (1024.0 * 1024.0),
+                     safety / (1024.0 * 1024.0),
+                     worst_streamed_overhead / (1024.0 * 1024.0),
+                     worst_streamed_param / (1024.0 * 1024.0));
             return;
         }
         const size_t available = max_graph_vram_bytes - reserved;
 
+        // Greedily mark segments RESIDENT in order.  Each RESIDENT segment
+        // consumes input_param_bytes of VRAM for the entire sampling loop.
         size_t cumulative = 0;
+        size_t resident_count = 0;
         for (auto& seg : plan.segments) {
             if (cumulative + seg.input_param_bytes > available) {
                 break;
             }
             seg.residency = SegmentResidency::RESIDENT;
             cumulative += seg.input_param_bytes;
+            resident_count++;
         }
+        LOG_INFO("[LTX][Placement] Residency: %zu/%zu segments RESIDENT (%.0f MB), rest STREAMED (budget=%.0f MB, available=%.0f MB)",
+                 resident_count, plan.segments.size(),
+                 cumulative / (1024.0 * 1024.0),
+                 max_graph_vram_bytes / (1024.0 * 1024.0),
+                 available / (1024.0 * 1024.0));
     }
 
 }  // namespace sd::ggml_graph_cut

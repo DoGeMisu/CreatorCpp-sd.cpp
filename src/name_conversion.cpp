@@ -1361,6 +1361,13 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         "lora.lycoris_",
         "lora.lycoris.",
         "lora.",
+        "lora_unet_",
+        "lora_te1_",
+        "lora_te2_",
+        "lora_te3_",
+        "lora_te_",
+        "lora_vae_",
+        "lora_text_encoder_",
     };
     std::vector<std::string> underline_lora_prefix_vec = {
         "unet_",
@@ -1376,6 +1383,12 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
             name    = name.substr(prefix.size());
             if (contains(prefix, "lycoris_")) {
                 is_lycoris_underline = true;
+            } else if (prefix == "lora_unet_" || prefix == "lora_te1_" || prefix == "lora_te2_" ||
+                       prefix == "lora_te3_" || prefix == "lora_te_" || prefix == "lora_vae_" ||
+                       prefix == "lora_text_encoder_") {
+                // kohya-style underscore naming (lora_unet_/lora_te_/...): strip the
+                // module prefix and always run sep_to_dot on the remaining name.
+                is_underline = true;
             } else {
                 for (const auto& underline_lora_prefix : underline_lora_prefix_vec) {
                     if (starts_with(name, underline_lora_prefix)) {
@@ -1510,9 +1523,10 @@ std::string convert_tensor_name(std::string name, SDVersion version) {
         }
         if (is_lora && !matched && !diffuison_model_prefix_vec.empty()) {
             if (starts_with(name, "down_blocks.") || starts_with(name, "up_blocks.") ||
-                starts_with(name, "mid_block.") || starts_with(name, "conv_in.") ||
-                starts_with(name, "conv_out.") || starts_with(name, "time_embedding.") ||
-                starts_with(name, "conv_norm_out.")) {
+                starts_with(name, "mid_block.") || starts_with(name, "input_blocks.") ||
+                starts_with(name, "output_blocks.") || starts_with(name, "middle_block.") ||
+                starts_with(name, "conv_in.") || starts_with(name, "conv_out.") ||
+                starts_with(name, "time_embedding.") || starts_with(name, "conv_norm_out.")) {
                 const std::string& canonical_prefix = diffuison_model_prefix_vec.front();
                 name                                = convert_diffusion_model_name(name, canonical_prefix, version);
                 name                                = canonical_prefix + name;

@@ -120,21 +120,84 @@ uint16_t f8_e4m3_to_f16(uint8_t f8) {
     return ggml_fp32_to_fp16(*reinterpret_cast<const float*>(&result));
 }
 
+float f8_e4m3_to_f32(uint8_t f8) {
+    const uint32_t exponent_bias = 7;
+    if (f8 == 0xff) {
+        return -NAN;
+    } else if (f8 == 0x7f) {
+        return NAN;
+    }
+
+    uint32_t sign     = f8 & 0x80;
+    uint32_t exponent = (f8 & 0x78) >> 3;
+    uint32_t mantissa = f8 & 0x07;
+    uint32_t result   = sign << 24;
+    if (exponent == 0) {
+        if (mantissa > 0) {
+            exponent = 0x7f - exponent_bias;
+
+            if ((mantissa & 0x04) == 0) {
+                mantissa &= 0x03;
+                mantissa <<= 1;
+                exponent -= 1;
+            }
+            if ((mantissa & 0x04) == 0) {
+                mantissa &= 0x03;
+                mantissa <<= 1;
+                exponent -= 1;
+            }
+
+            result |= (mantissa & 0x03) << 21;
+            result |= exponent << 23;
+        }
+    } else {
+        result |= mantissa << 20;
+        exponent += 0x7f - exponent_bias;
+        result |= exponent << 23;
+    }
+
+    return *reinterpret_cast<const float*>(&result);
+}
+
 uint16_t f8_e5m2_to_f16(uint8_t fp8) {
     return static_cast<uint16_t>(fp8) << 8;
 }
 
-void f8_e4m3_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n) {
+float f8_e5m2_to_f32(uint8_t fp8) {
+    // F8_E5M2: sign(1) + exp(5, bias=15) + mantissa(2)
+    // F8_E5M2 to F16: just shift left 8 (same bit layout for top 8 bits of F16)
+    // For F32 conversion, go through F16
+    uint16_t f16 = static_cast<uint16_t>(fp8) << 8;
+    return ggml_fp16_to_fp32(f16);
+}
+
+void f8_e4m3_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n, float scale) {
     // support inplace op
-    for (int64_t i = n - 1; i >= 0; i--) {
-        dst[i] = f8_e4m3_to_f16(src[i]);
+    if (scale == 1.0f) {
+        for (int64_t i = n - 1; i >= 0; i--) {
+            dst[i] = f8_e4m3_to_f16(src[i]);
+        }
+    } else {
+        for (int64_t i = n - 1; i >= 0; i--) {
+            // F8 -> F32 -> scale -> F16 (to properly apply per-tensor scale)
+            float f32 = f8_e4m3_to_f32(src[i]) * scale;
+            dst[i] = ggml_fp32_to_fp16(f32);
+        }
     }
 }
 
-void f8_e5m2_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n) {
+void f8_e5m2_to_f16_vec(uint8_t* src, uint16_t* dst, int64_t n, float scale) {
     // support inplace op
-    for (int64_t i = n - 1; i >= 0; i--) {
-        dst[i] = f8_e5m2_to_f16(src[i]);
+    if (scale == 1.0f) {
+        for (int64_t i = n - 1; i >= 0; i--) {
+            dst[i] = f8_e5m2_to_f16(src[i]);
+        }
+    } else {
+        for (int64_t i = n - 1; i >= 0; i--) {
+            // F8 -> F32 -> scale -> F16
+            float f32 = f8_e5m2_to_f32(src[i]) * scale;
+            dst[i] = ggml_fp32_to_fp16(f32);
+        }
     }
 }
 
@@ -525,7 +588,8 @@ SDVersion ModelLoader::get_sd_version() {
         if (tensor_storage.name.find("model.diffusion_model.double_blocks.0.img_mlp.gate_proj.weight") != std::string::npos) {
             return VERSION_OVIS_IMAGE;
         }
-        if (tensor_storage.name.find("model.diffusion_model.cap_embedder.0.weight") != std::string::npos) {
+        if (tensor_storage.name.find("model.diffusion_model.cap_embedder.0.weight") != std::string::npos ||
+            tensor_storage.name == "cap_embedder.0.weight") {
             return VERSION_Z_IMAGE;
         }
         if (tensor_storage.name.find("double_stream_layers.0.img_instruct_attn.processor.img_to_q.weight") != std::string::npos) {
@@ -1216,9 +1280,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
 
                     t0 = ggml_time_ms();
                     if (tensor_storage.is_f8_e4m3) {
-                        f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        f8_e4m3_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements(), tensor_storage.f8_scale);
                     } else if (tensor_storage.is_f8_e5m2) {
-                        f8_e5m2_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements());
+                        f8_e5m2_to_f16_vec((uint8_t*)read_buf, (uint16_t*)target_buf, tensor_storage.nelements(), tensor_storage.f8_scale);
                     } else if (tensor_storage.is_f64) {
                         f64_to_f32_vec((double*)read_buf, (float*)target_buf, tensor_storage.nelements());
                     } else if (tensor_storage.is_i64) {

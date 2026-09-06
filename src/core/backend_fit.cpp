@@ -121,6 +121,39 @@ namespace sd::backend_fit {
                 d.free_bytes  = (int64_t)free_bytes;
                 d.total_bytes = (int64_t)total_bytes;
 
+                // Safe GPU Memory Budget calculation:
+                // budget = free_vram - cuda_runtime - workspace - activations_headroom
+                // Instead of a crude "free - 512MB" or "total * 0.8", we use a
+                // dynamic multi-factor approach that adapts to any GPU size.
+                //
+                // Factors:
+                //   1. CUDA runtime overhead: ~256MB (driver, context, kernels)
+                //   2. ggml backend buffers: already accounted in free_bytes
+                //   3. Activation/workspace headroom: proportional to total VRAM
+                //      - Small VRAM (4-8GB): 512MB headroom
+                //      - Medium VRAM (12-24GB): 768MB headroom
+                //      - Large VRAM (32GB+): 1024MB headroom
+                //   4. Latent tensor storage: ~128MB for typical video sizes
+                //   5. Attention workspace: proportional, ~256MB baseline
+                constexpr int64_t CUDA_RUNTIME_OVERHEAD = 256 * MiB;
+                constexpr int64_t LATENT_STORAGE         = 128 * MiB;
+                constexpr int64_t ATTENTION_BASELINE    = 256 * MiB;
+
+                int64_t headroom;
+                if (d.total_bytes <= 8ll * 1024 * 1024 * 1024) {
+                    headroom = 512 * MiB;
+                } else if (d.total_bytes <= 24ll * 1024 * 1024 * 1024) {
+                    headroom = 768 * MiB;
+                } else {
+                    headroom = 1024 * MiB;
+                }
+
+                int64_t safe_budget = d.free_bytes
+                    - CUDA_RUNTIME_OVERHEAD
+                    - LATENT_STORAGE
+                    - ATTENTION_BASELINE
+                    - headroom;
+
                 std::string budget_key = d.name;
                 std::transform(budget_key.begin(), budget_key.end(), budget_key.begin(),
                                [](unsigned char c) { return (char)std::tolower(c); });
@@ -131,12 +164,20 @@ namespace sd::backend_fit {
                 }
                 if (gib > 0.f) {
                     d.budget_bytes = std::min<int64_t>((int64_t)(gib * 1024.0 * 1024.0 * 1024.0), d.free_bytes);
-                } else if (gib < 0.f) {
-                    d.budget_bytes = d.free_bytes + (int64_t)(gib * 1024.0 * 1024.0 * 1024.0);
                 } else {
-                    d.budget_bytes = d.free_bytes - 512 * MiB;
+                    // Auto-detect (gib <= 0, including -1 for video mode):
+                    // Use safe_budget directly. Do NOT subtract |gib| from it
+                    // (previous bug: safe_budget + (negative) = much smaller budget).
+                    d.budget_bytes = safe_budget;
                 }
                 d.budget_bytes = std::max<int64_t>(d.budget_bytes, 0);
+                LOG_INFO("[Placement] GPU %s: total=%.0f MB, free=%.0f MB, safe_budget=%.0f MB (headroom=%lld MB, runtime=%lld MB)",
+                         d.name.c_str(),
+                         (double)d.total_bytes / MiB,
+                         (double)d.free_bytes / MiB,
+                         (double)d.budget_bytes / MiB,
+                         (long long)(headroom / MiB),
+                         (long long)(CUDA_RUNTIME_OVERHEAD / MiB));
                 out.push_back(d);
             }
             return out;
@@ -292,9 +333,20 @@ namespace sd::backend_fit {
                 if (components[ci].kind != kind || components[ci].params_bytes == 0) {
                     continue;
                 }
+                const Component& comp = components[ci];
                 const Decision& decision = plan.decisions[ci];
                 if (decision.on_cpu) {
-                    append_assignment(runtime_spec, module_key, "cpu");
+                    // Model too large for VRAM budget: keep compute on GPU (CUDA)
+                    // but store weights in RAM. The ggml staging mechanism will
+                    // copy weights from RAM to VRAM as needed during compute.
+                    // This is fundamentally different from runtime=cpu which
+                    // forces all computation onto the CPU.
+                    LOG_INFO("[LTX][Placement] %s: Weights=%.0f MB -> RAM, Compute=CUDA (GPU_PLUS_RAM_OFFLOAD)",
+                             comp.name, (double)comp.params_bytes / MiB);
+                    if (!devices.empty()) {
+                        append_assignment(runtime_spec, module_key, devices[0].name);
+                    }
+                    append_assignment(params_spec, module_key, "cpu");
                     return;
                 }
                 if (decision.device_idxs.empty()) {
@@ -307,6 +359,10 @@ namespace sd::backend_fit {
                     }
                     device_list += devices[decision.device_idxs[k]].name;
                 }
+                LOG_INFO("[LTX][Placement] %s: Weights=%.0f MB -> GPU (%s), Compute=CUDA (GPU_ONLY%s)",
+                         comp.name, (double)comp.params_bytes / MiB,
+                         device_list.c_str(),
+                         plan.time_share ? ", time-share" : "");
                 append_assignment(runtime_spec, module_key, device_list);
                 if (plan.time_share) {
                     append_assignment(params_spec, module_key, "disk");

@@ -88,7 +88,9 @@ struct PuLIDExtension : public GenerationExtension {
     }
 
     bool init(const GenerationExtensionInitContext& ctx) override {
-        enabled = strlen(SAFE_STR(ctx.params->pulid_weights_path)) > 0;
+        // pulid_weights_path removed from sd_ctx_params_t for ABI compat — always disabled
+        // enabled = strlen(SAFE_STR(ctx.params->pulid_weights_path)) > 0;
+        enabled = false;
         return true;
     }
 
