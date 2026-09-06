@@ -2461,8 +2461,16 @@ protected:
             if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 size_t free_vram = 0, total_vram = 0;
                 ggml_backend_dev_memory(dev, &free_vram, &total_vram);
-                constexpr size_t safety_margin = 512ull * 1024 * 1024;
-                size_t free_clamp              = (free_vram > safety_margin) ? (free_vram - safety_margin) : 0;
+                // Dynamic safety margin proportional to total VRAM
+                size_t safety_margin;
+                if (total_vram <= 8ull * 1024 * 1024 * 1024) {
+                    safety_margin = 512ull * 1024 * 1024;
+                } else if (total_vram <= 24ull * 1024 * 1024 * 1024) {
+                    safety_margin = 768ull * 1024 * 1024;
+                } else {
+                    safety_margin = 1024ull * 1024 * 1024;
+                }
+                size_t free_clamp = (free_vram > safety_margin) ? (free_vram - safety_margin) : 0;
                 if (free_clamp < effective_budget) {
                     LOG_DEBUG("%s clamping streaming budget: actual free VRAM %.2f MB < user cap %.2f MB",
                               get_desc().c_str(),
@@ -2931,7 +2939,8 @@ protected:
                                                             const GraphCutPlan& plan,
                                                             int n_threads,
                                                             bool log_residency,
-                                                            bool no_return = false) {
+                                                            bool no_return              = false,
+                                                            bool free_compute_params_all = true) {
         GGML_ASSERT(gf != nullptr);
 
         free_compute_buffer();
@@ -2981,7 +2990,13 @@ protected:
 
             ggml_context* segment_graph_ctx = nullptr;
             ggml_cgraph* segment_graph      = sd::ggml_graph_cut::build_segment_graph(gf, segment, &segment_graph_ctx);
-            const bool keep_segment_params  = segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT;
+            // RESIDENT segments keep their staging across steps when the
+            // caller requests it (free_compute_params_all = false), so the
+            // weights stay GPU-resident for the entire sampling loop.
+            // STREAMED segments always free staging per step because they
+            // cannot all coexist in VRAM simultaneously.
+            const bool keep_segment_params = segment.residency == sd::ggml_graph_cut::SegmentResidency::RESIDENT
+                                                && !free_compute_params_all;
             auto segment_output             = execute_graph<T>(segment_graph,
                                                    n_threads,
                                                    true,
@@ -3007,6 +3022,12 @@ protected:
 
 public:
     void runner_done() {
+        // Synchronize the compute backend before releasing any weight
+        // buffers to ensure no in-flight CUDA kernels are still
+        // referencing the staging memory.
+        if (runtime_backend != nullptr && !sd_backend_is_cpu(runtime_backend)) {
+            ggml_backend_synchronize(runtime_backend);
+        }
         free_compute_buffer();
         std::vector<ggml_tensor*> tensors_to_release = std::move(this->runner_param_tensors);
         this->runner_param_tensors.clear();
@@ -3194,7 +3215,8 @@ public:
                                                      plan,
                                                      n_threads,
                                                      stream_layers_enabled,
-                                                     no_return);
+                                                     no_return,
+                                                     free_compute_params);
             }
         }
         return execute_graph<T>(gf,
@@ -3548,7 +3570,10 @@ protected:
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
         enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
         if (!support_get_rows(wtype)) {
-            wtype = GGML_TYPE_F32;
+            // Fallback: quantized K-quants (e.g. Q3_K) are not safe for GGML_OP_GET_ROWS
+            // in this codebase. Store embedding rows as F16 instead of F32 — halves the
+            // resident footprint and H2D staging traffic while remaining supported.
+            wtype = GGML_TYPE_F16;
         }
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, embedding_dim, num_embeddings);
     }
