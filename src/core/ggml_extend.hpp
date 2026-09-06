@@ -3570,10 +3570,7 @@ protected:
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map, const std::string prefix = "") override {
         enum ggml_type wtype = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F32);
         if (!support_get_rows(wtype)) {
-            // Fallback: quantized K-quants (e.g. Q3_K) are not safe for GGML_OP_GET_ROWS
-            // in this codebase. Store embedding rows as F16 instead of F32 — halves the
-            // resident footprint and H2D staging traffic while remaining supported.
-            wtype = GGML_TYPE_F16;
+            wtype = GGML_TYPE_F32;
         }
         params["weight"] = ggml_new_tensor_2d(ctx, wtype, embedding_dim, num_embeddings);
     }
