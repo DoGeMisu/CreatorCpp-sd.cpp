@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <unordered_set>
@@ -10,81 +9,6 @@
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
-
-// B (pinned bounce pipeline): extern declaration of the small pinned
-// allocation entry point exported by ggml-cuda.cu (see copy_via_pinned_bounce).
-void* ggml_cuda_host_malloc_extern(size_t size);
-
-// B (pinned bounce pipeline): chunk size for streaming H2D copies through a
-// small pinned staging buffer when the full-size pinned params buffer could
-// not be allocated (pageable source otherwise limits H2D to ~1 GB/s).
-// Two half-sized buffers allow the next memcpy to overlap with the in-flight
-// cudaMemcpyAsync (classic double-buffering pipeline).
-static constexpr size_t kPinnedBounceChunk = 128 * 1024 * 1024;
-
-static bool copy_via_pinned_bounce(ggml_backend_t compute_backend,
-                                   ggml_tensor* dst,
-                                   const void* src,
-                                   size_t nbytes,
-                                   const char* dbg_name) {
-    // Try to allocate modest pinned bounce buffers once (falls back to plain
-    // copy on failure; this keeps behavior identical when pinning is refused).
-    static thread_local void*  bounce_ptr[2]  = {nullptr, nullptr};
-    static thread_local size_t bounce_cap     = 0;
-    static thread_local bool   warn_shown     = false;
-
-    if (bounce_ptr[0] == nullptr || bounce_cap < kPinnedBounceChunk) {
-        if (bounce_ptr[0] != nullptr) {
-            free(bounce_ptr[0]);
-            bounce_ptr[0] = nullptr;
-        }
-        if (bounce_ptr[1] != nullptr) {
-            free(bounce_ptr[1]);
-            bounce_ptr[1] = nullptr;
-        }
-        void* p0 = ggml_cuda_host_malloc_extern(kPinnedBounceChunk);
-        if (p0 == nullptr) {
-            if (!warn_shown) {
-                LOG_WARN("model manager pinned bounce buffer alloc failed (%zu MiB), using pageable copies",
-                         kPinnedBounceChunk / (1024 * 1024));
-                warn_shown = true;
-            }
-            return false;
-        }
-        void* p1 = ggml_cuda_host_malloc_extern(kPinnedBounceChunk);
-        if (p1 == nullptr) {
-            free(p0);
-            if (!warn_shown) {
-                LOG_WARN("model manager pinned bounce buffer #2 alloc failed, using pageable copies");
-                warn_shown = true;
-            }
-            return false;
-        }
-        bounce_ptr[0] = p0;
-        bounce_ptr[1] = p1;
-        bounce_cap    = kPinnedBounceChunk;
-    }
-
-    const char* src_bytes = static_cast<const char*>(src);
-    size_t done           = 0;
-    int slot              = 0;
-    while (done < nbytes) {
-        size_t n = nbytes - done;
-        if (n > bounce_cap) {
-            n = bounce_cap;
-        }
-        memcpy(bounce_ptr[slot], src_bytes + done, n);
-        ggml_backend_tensor_set_async(compute_backend, dst,
-                                      bounce_ptr[slot], done, n);
-        // No sync: the next chunk memcpy targets the OTHER buffer, so the
-        // in-flight copy never overlaps the memory being rewritten. The copy
-        // ordering on the same CUDA stream keeps H2D copies serialized.
-        done += n;
-        slot ^= 1;
-    }
-    (void)dbg_name;
-    return true;
-}
 
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
     GGML_ASSERT(alignment != 0 && (alignment & (alignment - 1)) == 0);
@@ -556,32 +480,7 @@ bool ModelManager::stage_tensors_to_compute_backend(const std::vector<TensorStat
             TensorState* state          = staged_tensor.first;
             ggml_tensor* managed_tensor = state->tensor;
             ggml_tensor* staging_tensor = staged_tensor.second;
-            const size_t nbytes = ggml_nbytes(managed_tensor);
-            // Use async H2D copy on the compute backend's stream so all
-            // tensors in this batch are enqueued back-to-back without
-            // per-tensor cudaStreamSynchronize.  The single synchronize
-            // after the loop ensures all copies are complete before the
-            // tensor metadata swap.
-            //
-            // B: when the source is pageable RAM (large pinned params buffer
-            // allocation failed), stream the copy through a pinned bounce
-            // buffer so each chunk runs at hardware H2D speed instead of the
-            // slow pageable path.
-            bool copied = false;
-            if (nbytes >= 2 * 1024 * 1024) {
-                copied = copy_via_pinned_bounce(compute_backend,
-                                                staging_tensor,
-                                                managed_tensor->data,
-                                                nbytes,
-                                                managed_tensor->name);
-            }
-            if (!copied) {
-                ggml_backend_tensor_set_async(compute_backend,
-                                              staging_tensor,
-                                              managed_tensor->data,
-                                              0,
-                                              nbytes);
-            }
+            ggml_backend_tensor_copy(managed_tensor, staging_tensor);
             std::swap(managed_tensor->buffer, staging_tensor->buffer);
             std::swap(managed_tensor->data, staging_tensor->data);
             std::swap(managed_tensor->extra, staging_tensor->extra);
