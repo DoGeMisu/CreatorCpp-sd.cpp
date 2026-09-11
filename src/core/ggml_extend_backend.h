@@ -77,6 +77,7 @@ public:
     bool params_backend_is_cpu(SDBackendModule module);
     bool params_backend_is_disk(SDBackendModule module) const;
     bool params_backend_follows_runtime(SDBackendModule module) const;
+    bool params_backend_host_offload(SDBackendModule module) const;
     bool runtime_backend_supports_host_buffer(SDBackendModule module);
 
 private:

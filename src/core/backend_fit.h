@@ -13,7 +13,8 @@ namespace sd::backend_fit {
                               ggml_type override_wtype,
                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
                               std::string& runtime_spec,
-                              std::string& params_spec);
+                              std::string& params_spec,
+                              bool host_offload_for_cpu = false);
 
     bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params,
                                          bool prefer_temporal_tiling);

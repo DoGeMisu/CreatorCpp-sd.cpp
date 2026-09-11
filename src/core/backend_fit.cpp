@@ -328,7 +328,8 @@ namespace sd::backend_fit {
                                        ComponentKind kind,
                                        const char* module_key,
                                        std::string& runtime_spec,
-                                       std::string& params_spec) {
+                                       std::string& params_spec,
+                                       bool host_offload_for_cpu) {
             for (size_t ci = 0; ci < components.size(); ci++) {
                 if (components[ci].kind != kind || components[ci].params_bytes == 0) {
                     continue;
@@ -341,6 +342,20 @@ namespace sd::backend_fit {
                     // copy weights from RAM to VRAM as needed during compute.
                     // This is fundamentally different from runtime=cpu which
                     // forces all computation onto the CPU.
+                    if (host_offload_for_cpu) {
+                        // ComfyUI-style low-VRAM offload: weights stay resident in
+                        // host-pinned (zero-copy) RAM and CUDA kernels consume them
+                        // directly. No per-step staging copies. The "host" params
+                        // token makes params_backend follow the runtime backend so
+                        // the model manager skips staging and uses the pinned buft.
+                        LOG_INFO("[LTX][Placement] %s: Weights=%.0f MB -> RAM(pinned, zero-copy), Compute=CUDA (HOST_OFFLOAD)",
+                                 comp.name, (double)comp.params_bytes / MiB);
+                        if (!devices.empty()) {
+                            append_assignment(runtime_spec, module_key, devices[0].name);
+                        }
+                        append_assignment(params_spec, module_key, "host");
+                        return;
+                    }
                     LOG_INFO("[LTX][Placement] %s: Weights=%.0f MB -> RAM, Compute=CUDA (GPU_PLUS_RAM_OFFLOAD)",
                              comp.name, (double)comp.params_bytes / MiB);
                     if (!devices.empty()) {
@@ -377,7 +392,8 @@ namespace sd::backend_fit {
                               ggml_type override_wtype,
                               sd::ggml_graph_cut::MaxVramAssignment& budgets,
                               std::string& runtime_spec,
-                              std::string& params_spec) {
+                              std::string& params_spec,
+                              bool host_offload_for_cpu) {
         if (!runtime_spec.empty() || !params_spec.empty()) {
             LOG_WARN("--auto-fit is enabled; ignoring --backend / --params-backend");
         }
@@ -404,9 +420,9 @@ namespace sd::backend_fit {
 
         std::string derived_runtime_spec;
         std::string derived_params_spec;
-        append_component_decision(components, devices, plan, ComponentKind::DIT, "diffusion", derived_runtime_spec, derived_params_spec);
-        append_component_decision(components, devices, plan, ComponentKind::CONDITIONER, "te", derived_runtime_spec, derived_params_spec);
-        append_component_decision(components, devices, plan, ComponentKind::VAE, "vae", derived_runtime_spec, derived_params_spec);
+        append_component_decision(components, devices, plan, ComponentKind::DIT, "diffusion", derived_runtime_spec, derived_params_spec, host_offload_for_cpu);
+        append_component_decision(components, devices, plan, ComponentKind::CONDITIONER, "te", derived_runtime_spec, derived_params_spec, host_offload_for_cpu);
+        append_component_decision(components, devices, plan, ComponentKind::VAE, "vae", derived_runtime_spec, derived_params_spec, host_offload_for_cpu);
 
         runtime_spec = std::move(derived_runtime_spec);
         params_spec  = std::move(derived_params_spec);

@@ -413,7 +413,8 @@ public:
                                                      params_mem_size,
                                                      false,
                                                      false,
-                                                     &tensor_ops);
+                                                     &tensor_ops,
+                                                     backend_manager.params_backend_host_offload(module));
     }
 
     template <typename T>
@@ -918,12 +919,12 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
         split_mode_spec     = "";     // hardcoded: split_mode removed from sd_ctx_params_t for ABI compat
         auto_fit_enabled    = false;  // hardcoded: auto_fit removed from sd_ctx_params_t for ABI compat
         max_vram_assignment.reset(0.f);
+        bool video_mode = false;
         {
             // Detect video mode: when SD_VIDEO_MODE=1, enable dynamic VRAM detection
             // and auto_fit regardless of params_backend_spec. This allows the video
             // pipeline to intelligently place weights on GPU/CPU based on actual
             // available VRAM, instead of hardcoding all weights to CPU.
-            bool video_mode = false;
             {
                 char vm_buf[16] = {0};
                 DWORD vm_len = 0;
@@ -942,14 +943,12 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                     LOG_INFO("SD_VIDEO_MODE: clearing params_backend_spec \"%s\" for auto_fit", params_backend_spec.c_str());
                     params_backend_spec = "";
                 }
-                // Enable stream_layers in video mode: allows annotate_residency
-                // to mark graph segments as RESIDENT (kept in VRAM across sampling
-                // steps) instead of defaulting to STREAMED (free+restage every step).
-                // This is the key optimization for reducing PCIe transfer in the
-                // diffusion sampling loop when the model is partially offloaded to RAM.
-                // stream_layers is only effective when params_backend is cpu (checked below).
-                stream_layers = true;
-                LOG_INFO("SD_VIDEO_MODE: stream_layers enabled for sampling loop optimization");
+                // ComfyUI-style low-VRAM offload: weights stay in host-pinned RAM
+                // and CUDA computes directly; no graph segmentation and no
+                // per-step restaging. stream_layers is only meaningful with the
+                // old staged-graph-cut pipeline, so it stays disabled here.
+                stream_layers = false;
+                LOG_INFO("SD_VIDEO_MODE: stream_layers disabled (host-offload single-graph execution)");
             }
             // max_vram is now a float (GiB), 0=disabled, -1=auto
             // Convert to the string format that MaxVramAssignment::parse() expects
@@ -972,7 +971,11 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                 }
                 auto_fit_enabled = true;
                 if (video_mode) {
-                    LOG_INFO("SD_VIDEO_MODE: auto_fit enabled with max_vram=-1 (auto-detect free VRAM)");
+                    // Host-offload single-graph execution: auto_fit still decides
+                    // per-module placement (VRAM vs host-pinned RAM), but graph
+                    // segmentation is disabled so weights are never staged/cut.
+                    max_vram_assignment.enable_graph_cut = false;
+                    LOG_INFO("SD_VIDEO_MODE: auto_fit enabled with max_vram=-1 (auto-detect free VRAM), graph cut bypassed");
                 } else {
                     LOG_INFO("max_vram=%.2f GiB specified, auto-enabling auto-fit for CPU offload", mv);
                 }
@@ -1053,7 +1056,8 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                                                        sd_type_to_ggml_type(sd_ctx_params->wtype),
                                                        max_vram_assignment,
                                                        backend_spec,
-                                                       params_backend_spec)) {
+                                                       params_backend_spec,
+                                                       video_mode)) {
                 return false;
             }
         }

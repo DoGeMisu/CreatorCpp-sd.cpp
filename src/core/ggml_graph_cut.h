@@ -73,6 +73,10 @@ namespace sd::ggml_graph_cut {
         float default_gib = 0.f;
         std::unordered_map<std::string, float> backend_gib;
         std::unordered_map<std::string, size_t> resolved_backend_bytes;
+        // When false, bytes_for_backend() returns 0 so graph splitting is
+        // bypassed (ComfyUI-style single-graph execution with host-offloaded
+        // weights; activations stay in VRAM).
+        bool enable_graph_cut = true;
 
         void reset(float fallback_gib);
         bool parse(const std::string& raw_spec, std::string* error);

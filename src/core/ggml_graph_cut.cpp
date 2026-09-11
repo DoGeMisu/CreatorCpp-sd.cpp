@@ -213,6 +213,9 @@ namespace sd::ggml_graph_cut {
     }
 
     size_t MaxVramAssignment::bytes_for_backend(ggml_backend_t backend) {
+        if (!enable_graph_cut) {
+            return 0;
+        }
         std::vector<std::string> keys = backend_budget_keys(backend);
         const std::string cache_key   = keys.empty() ? std::string("<none>") : keys.front();
         auto cached                   = resolved_backend_bytes.find(cache_key);

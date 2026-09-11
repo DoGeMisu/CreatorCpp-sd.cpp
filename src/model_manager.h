@@ -38,6 +38,7 @@ private:
         ggml_backend_t params_backend      = nullptr;
         bool allow_split_buffer            = false;
         bool params_follow_compute_backend = false;
+        bool host_offload_params           = false;
         bool metadata_validated            = false;
         enum ggml_op usage_op              = GGML_OP_NONE;
 
@@ -134,7 +135,8 @@ public:
                                 size_t* registered_tensor_size                         = nullptr,
                                 bool allow_split_buffer                                = false,
                                 bool params_follow_compute_backend                     = false,
-                                const std::map<ggml_tensor*, enum ggml_op>* tensor_ops = nullptr);
+                                const std::map<ggml_tensor*, enum ggml_op>* tensor_ops = nullptr,
+                                bool host_offload_params                               = false);
 
     bool unregister_param_tensors(const std::string& desc,
                                   size_t* registered_tensor_size = nullptr);

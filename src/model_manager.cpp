@@ -8,6 +8,7 @@
 
 #include "core/ggml_extend_backend.h"
 #include "core/util.h"
+#include "ggml-cuda.h"
 #include "model/adapter/lora.hpp"
 
 static size_t aligned_offset(const void* buffer, size_t offset, size_t alignment) {
@@ -178,7 +179,8 @@ bool ModelManager::register_param_tensors(const std::string& desc,
                                           size_t* registered_tensor_size,
                                           bool allow_split_buffer,
                                           bool params_follow_compute_backend,
-                                          const std::map<ggml_tensor*, enum ggml_op>* tensor_ops) {
+                                          const std::map<ggml_tensor*, enum ggml_op>* tensor_ops,
+                                          bool host_offload_params) {
     if (desc.empty()) {
         LOG_ERROR("model manager tensor desc is empty");
         return false;
@@ -211,6 +213,7 @@ bool ModelManager::register_param_tensors(const std::string& desc,
         state->params_backend                = params_backend;
         state->allow_split_buffer            = allow_split_buffer;
         state->params_follow_compute_backend = params_follow_compute_backend;
+        state->host_offload_params           = host_offload_params;
         if (tensor_ops != nullptr) {
             auto op_it = tensor_ops->find(tensor);
             if (op_it != tensor_ops->end()) {
@@ -696,6 +699,11 @@ bool ModelManager::mmap_params(const std::vector<TensorState*>& states,
 }
 
 bool ModelManager::can_mmap_storage(const TensorState& state) const {
+    if (state.host_offload_params) {
+        // Host-offload params must live in the pinned/zero-copy buffer, not in
+        // an mmap'd file region; mmap would bypass the pinned buft allocation.
+        return false;
+    }
     if (!enable_mmap_ || state.residency_mode != ResidencyMode::ParamBackend) {
         return false;
     }
@@ -880,6 +888,34 @@ ggml_backend_buffer_type_t ModelManager::params_buffer_type_for(const TensorStat
     if (state.params_backend == nullptr) {
         LOG_ERROR("model manager params backend is null for tensor '%s'", state.name.c_str());
         return nullptr;
+    }
+    if (state.host_offload_params) {
+        // ComfyUI-style low-VRAM offload: weights live in host-pinned (zero-copy)
+        // RAM and CUDA kernels consume them directly. compute_backend must be a
+        // CUDA device backend for this to be valid.
+        ggml_backend_dev_t compute_dev = ggml_backend_get_device(state.compute_backend);
+        if (compute_dev != nullptr) {
+            int device = -1;
+            // Resolve the device index from the CUDA device name via the registry.
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(compute_dev);
+            if (reg != nullptr) {
+                const size_t dev_count = ggml_backend_reg_dev_count(reg);
+                for (size_t i = 0; i < dev_count; i++) {
+                    if (ggml_backend_reg_dev_get(reg, i) == compute_dev) {
+                        device = (int)i;
+                        break;
+                    }
+                }
+            }
+            if (device >= 0) {
+                ggml_backend_buffer_type_t pinned_buft = ggml_backend_cuda_pinned_buffer_type(device);
+                if (pinned_buft != nullptr) {
+                    return pinned_buft;
+                }
+            }
+        }
+        LOG_WARN("model manager host_offload_params for tensor '%s' but no CUDA pinned buft available; "
+                 "falling back to default params buffer", state.name.c_str());
     }
     ggml_backend_buffer_type_t params_buft = nullptr;
     if (state.compute_backend != nullptr && state.params_backend != state.compute_backend) {

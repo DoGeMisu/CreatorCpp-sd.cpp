@@ -50,6 +50,10 @@ static bool is_disk_backend_token(const std::string& name) {
     return lower_copy(trim_copy(name)) == "disk";
 }
 
+static bool is_host_offload_backend_token(const std::string& name) {
+    return lower_copy(trim_copy(name)) == "host";
+}
+
 static bool parse_backend_module(const std::string& raw_name, SDBackendModule* module) {
     std::string name = lower_copy(trim_copy(raw_name));
     name.erase(std::remove(name.begin(), name.end(), '-'), name.end());
@@ -722,7 +726,12 @@ ggml_backend_t SDBackendManager::params_backend(SDBackendModule module) {
     if (name.empty()) {
         return runtime_backend(module);
     }
-    if (is_disk_backend_token(name)) {
+    if (is_disk_backend_token(name) || is_host_offload_backend_token(name)) {
+        // disk: params are streamed from disk per phase; the backend handle used
+        // for registration is the runtime one (no separate params backend).
+        // host: ComfyUI-style host-pinned zero-copy offload; params follow the
+        // runtime backend so the model manager skips staging and uses the pinned
+        // buffer type directly.
         return runtime_backend(module);
     }
     return init_cached_backend(name);
@@ -742,6 +751,10 @@ bool SDBackendManager::params_backend_is_disk(SDBackendModule module) const {
 
 bool SDBackendManager::params_backend_follows_runtime(SDBackendModule module) const {
     return params_assignment_.get(module).empty();
+}
+
+bool SDBackendManager::params_backend_host_offload(SDBackendModule module) const {
+    return is_host_offload_backend_token(params_assignment_.get(module));
 }
 
 bool SDBackendManager::runtime_backend_supports_host_buffer(SDBackendModule module) {
@@ -862,7 +875,7 @@ bool SDBackendManager::validate(std::string* error) const {
         return true;
     };
     auto validate_params_name = [&](const std::string& name) -> bool {
-        if (is_disk_backend_token(name)) {
+        if (is_disk_backend_token(name) || is_host_offload_backend_token(name)) {
             return true;
         }
         if (name.find('&') != std::string::npos) {
