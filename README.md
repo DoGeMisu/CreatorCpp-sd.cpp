@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: '2cdeb6ee-14ee-430a-83e1-74638ca084d0'
+  PropagateID: '2cdeb6ee-14ee-430a-83e1-74638ca084d0'
+  ReservedCode1: '46b9dfd6-63bb-4d88-b995-0f54b87f4438'
+  ReservedCode2: '46b9dfd6-63bb-4d88-b995-0f54b87f4438'
+---
+
 <p align="center">
   <img src="./assets/logo.png" width="360x">
 </p>
@@ -9,6 +20,17 @@
 </div>
 
 Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
+
+> [!IMPORTANT]
+> **这是 CreatorCpp 定制版 fork** — 引擎服务于 [CreatorCpp](https://github.com/DoGeMisu/CreatorCpp) 本地生图工作台（8GB 显存优化实践）。上游全部功能保留，可跟随上游更新。
+>
+> **相对上游的定制**（详见下方说明）：
+> 1. **fp8_scaled per-tensor scale 修复** — 修复 `nlohmann::json` 字母序迭代导致 scale 恒为 1.0，以及 F8 原地覆盖产生 NaN 的两个连锁 bug
+> 2. **Krea2 参考图 v3 API** — `sd_encode_image_prompt_v3`（视觉塔 + 多参考图 + FA）、`ref_images_strength` per-image 强度、encode-only version 预设
+> 3. **显存管理** — ComfyUI 风格 host-offload 架构 + ggml 子模块定制（[CreatorCpp-ggml](https://github.com/DoGeMisu/CreatorCpp-ggml)，pinned memory `cudaMemAdvise` 零拷贝），8GB 显存跑 20B 级模型
+> 4. Krea2 `flow_shift`、diffusion-model-only TE/VAE 校验跳过
+>
+> 定制提交作者为 `DoGeMisu`（`git log --author=DoGeMisu`），完整上游历史保留便于合并。
 
 ***Note that this project is under active development. \
 API and command-line option may change frequently.***
