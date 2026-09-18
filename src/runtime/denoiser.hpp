@@ -1299,6 +1299,23 @@ struct FluxFlowDenoiser : public DiscreteFlowDenoiser {
     }
 };
 
+// Z-Image (Lumina2 NextDiT): model returns -img (negated prediction).
+// ComfyUI's calculate_denoised returns model_output directly for FLOW models.
+// c_skip=0, c_out=1 => denoised = model_output = -img.
+// MUST be paired with timestep = 1-sigma in prepare_sample_timesteps.
+struct ZImageFlowDenoiser : public DiscreteFlowDenoiser {
+    ZImageFlowDenoiser(float shift = 3.0f) {
+        set_shift(shift);
+    }
+
+    std::vector<float> get_scalings(float sigma) override {
+        float c_skip = 0.0f;
+        float c_out  = 1.0f;
+        float c_in   = 1.0f;
+        return {c_skip, c_out, c_in};
+    }
+};
+
 struct SefiFlowDenoiser;
 
 struct SefiFlowDenoiser : public FluxFlowDenoiser {

@@ -1,4 +1,4 @@
-#include <algorithm>
+﻿#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -1246,7 +1246,12 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     if (dst_tensor->buffer == nullptr || ggml_backend_buffer_is_host(dst_tensor->buffer)) {
                         if (tensor_storage.type == dst_tensor->type) {
                             GGML_ASSERT(ggml_nbytes(dst_tensor) == tensor_storage.nbytes());
-                            if (tensor_storage.is_f64 || tensor_storage.is_i64) {
+                            if (tensor_storage.is_f64 || tensor_storage.is_i64 || tensor_storage.is_f8_e4m3 || tensor_storage.is_f8_e5m2) {
+                                // Element-type remap (F64->F32 / I64->I32 / F8->F16) needs a
+                                // SEPARATE read buffer: nbytes_to_read != nbytes, and the in-place
+                                // variant (read_buf == target_buf == dst_tensor->data) makes
+                                // f8_e4m3_to_f16_vec read from memory it has already overwritten,
+                                // producing NaN garbage (e.g. Comfy-Org fp8_scaled TE models).
                                 read_buffer.resize(tensor_storage.nbytes_to_read());
                                 read_buf = (char*)read_buffer.data();
                             } else {

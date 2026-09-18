@@ -240,11 +240,54 @@ bool read_safetensors_file(const std::string& file_path,
     // "<module>.scale_weight" (F32 [1]) alongside "<module>.weight" (F8_E4M3).
     // We read the scale value and store it in the corresponding TensorStorage,
     // then skip the scale_weight tensor itself (it's metadata, not a model weight).
+    //
+    // IMPORTANT: nlohmann::json uses std::map (alphabetical key order), so
+    // ".weight" sorts BEFORE ".weight_scale".  A single-pass loop would process
+    // the F8 weight tensor before its scale tensor is collected.  We must do a
+    // separate first pass to collect ALL scale positions, then a second pass to
+    // process weight tensors and look up the pre-collected scales.
     struct ScaleWeightInfo {
         size_t offset;  // absolute file offset (data_start + begin)
         size_t size;     // byte size (should be 4 for F32 [1])
     };
     std::unordered_map<std::string, ScaleWeightInfo> scale_weight_map;
+
+    // ---- Pass 1: collect scale tensor positions ----
+    for (auto& item : header_.items()) {
+        const std::string& name = item.key();
+        if (name == "__metadata__") {
+            continue;
+        }
+        const nlohmann::json& tensor_info = item.value();
+        std::string dtype = tensor_info.value("dtype", "");
+        if (dtype != "F32") {
+            continue;
+        }
+        bool is_scale_tensor = false;
+        std::string scale_module_name;
+        if (ends_with(name, ".scale_weight")) {
+            scale_module_name = name.substr(0, name.size() - std::string(".scale_weight").size());
+            is_scale_tensor   = true;
+        } else if (ends_with(name, ".weight_scale")) {
+            scale_module_name = name.substr(0, name.size() - std::string(".weight_scale").size());
+            is_scale_tensor   = true;
+        }
+        if (!is_scale_tensor) {
+            continue;
+        }
+        const nlohmann::json& shape = tensor_info["shape"];
+        if (shape.size() == 0 || (shape.size() == 1 && shape[0].get<int64_t>() == 1)) {
+            size_t begin = tensor_info["data_offsets"][0].get<size_t>();
+            size_t end   = tensor_info["data_offsets"][1].get<size_t>();
+            if (begin > end || end > file_size_ - data_start) {
+                set_error(error, "data offsets out of bounds for tensor '" + name + "'");
+                return false;
+            }
+            scale_weight_map[scale_module_name] = {data_start + begin, end - begin};
+        }
+    }
+
+    // ---- Pass 2: process all non-scale tensors ----
 
     for (auto& item : header_.items()) {
         std::string name           = item.key();
@@ -262,18 +305,9 @@ bool read_safetensors_file(const std::string& file_path,
             continue;
         }
 
-        // Detect and collect scale_weight tensors (F32 scalar for F8 quantized models)
-        if (ends_with(name, ".scale_weight") && dtype == "F32" && shape.size() == 1 && shape[0].get<int64_t>() == 1) {
-            size_t begin = tensor_info["data_offsets"][0].get<size_t>();
-            size_t end   = tensor_info["data_offsets"][1].get<size_t>();
-            if (begin > end || end > file_size_ - data_start) {
-                set_error(error, "data offsets out of bounds for tensor '" + name + "'");
-                return false;
-            }
-            // Map from module name (name without ".scale_weight" suffix) to its offset
-            std::string module_name = name.substr(0, name.size() - std::string(".scale_weight").size());
-            scale_weight_map[module_name] = {data_start + begin, end - begin};
-            continue;  // Don't add scale_weight as a model tensor
+        // Skip scale tensors (already collected in Pass 1)
+        if (ends_with(name, ".scale_weight") || ends_with(name, ".weight_scale")) {
+            continue;
         }
 
         size_t begin = tensor_info["data_offsets"][0].get<size_t>();
@@ -378,26 +412,19 @@ bool read_safetensors_file(const std::string& file_path,
 
         // Read per-tensor scale factor for F8_E4M3/F8_E5M2 (ComfyUI scaled_fp8 format)
         if (tensor_storage.is_f8_e4m3 || tensor_storage.is_f8_e5m2) {
-            // The weight tensor name is e.g. "layers.0.attention.qkv.weight"
-            // The scale tensor name is "layers.0.attention.qkv.scale_weight"
-            // We already collected scale_weight positions above; look up by module name
-            // (weight name without ".weight" suffix)
             std::string module_name;
             if (ends_with(name, ".weight")) {
                 module_name = name.substr(0, name.size() - std::string(".weight").size());
             }
             if (!module_name.empty()) {
                 auto scale_it = scale_weight_map.find(module_name);
-                if (scale_it != scale_weight_map.end()) {
-                    // Read the 4-byte F32 scale value
-                    if (scale_it->second.size >= 4) {
-                        file.clear();
-                        file.seekg((std::streamoff)scale_it->second.offset, std::ios::beg);
-                        float scale_val = 1.0f;
-                        file.read((char*)&scale_val, 4);
-                        if (file) {
-                            tensor_storage.f8_scale = scale_val;
-                        }
+                if (scale_it != scale_weight_map.end() && scale_it->second.size >= 4) {
+                    file.clear();
+                    file.seekg((std::streamoff)scale_it->second.offset, std::ios::beg);
+                    float scale_val = 1.0f;
+                    file.read((char*)&scale_val, 4);
+                    if (file) {
+                        tensor_storage.f8_scale = scale_val;
                     }
                 }
             }

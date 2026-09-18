@@ -398,6 +398,12 @@ typedef struct {
     int qwen_image_layers;
     bool circular_x;
     bool circular_y;
+    // Per-reference-image strength (optional; array parallel to ref_images):
+    //   st <= 0 : the image is excluded entirely (caller should not pass it at all)
+    //   0 < st < 1 : VLM sees the image normally; the DiT ref latent is linearly scaled
+    //   st >= 1   : full strength (no scaling)
+    // May be NULL: all ref images are treated as full strength.
+    float* ref_images_strength;
 } sd_img_gen_params_t;
 
 typedef struct {
@@ -572,6 +578,59 @@ SD_API bool sd_encode_ltxav_prompt(const char* llm_path,
                                    int n_threads,
                                    const char* cond_out_path,
                                    const char* uncond_out_path);
+
+// ===========================================================================
+// Two-phase image generation (Z-Image / low-VRAM flow)
+//
+// Phase 1 (sd_encode_image_prompt): Text encoder only — load the Qwen3 TE
+//        (GGUF or safetensors), encode cond/uncond, persist embeddings to
+//        disk, release the context.  Peak VRAM ~= TE size only.
+// Phase 2 (new_sd_ctx WITHOUT llm_path + sd_ctx_set_precomputed_embeddings
+//        + sd_generate_image): Diffusion + VAE only — the conditioner is
+//        skipped and embeddings are read from disk.  Peak VRAM ~= DiT + VAE.
+// ===========================================================================
+// Encoder type for sd_encode_image_prompt_v2:
+//   100 = Z-Image  (Qwen3-4B text-only LLM)
+//   200 = Krea2    (Qwen3-VL-4B multimodal LLM)
+SD_API bool sd_encode_image_prompt_v2(const char* llm_path,
+                                      const char* prompt,
+                                      const char* negative_prompt,
+                                      int n_threads,
+                                      const char* cond_out_path,
+                                      const char* uncond_out_path,
+                                      int encoder_type);
+
+// Backward-compatible wrapper: always uses encoder_type 100 (Z-Image).
+SD_API bool sd_encode_image_prompt(const char* llm_path,
+                                   const char* prompt,
+                                   const char* negative_prompt,
+                                   int n_threads,
+                                   const char* cond_out_path,
+                                   const char* uncond_out_path);
+
+// v3: adds the Krea2 reference-image flow (VLM branch of the two-phase pipeline).
+//   llm_vision_path : optional separate vision-tower weights (e.g. mmproj-*.gguf).
+//                     NULL = vision disabled (text-only encoding).
+//   ref_images      : optional reference images shown to the VLM. Images with
+//                     strength <= 0 must be filtered out by the CALLER so that
+//                     the VLM token layout and the Phase-2 DiT ref latents stay
+//                     consistent. May be NULL (text-only).
+//   ref_image_args  : optional preset/overrides, e.g. "preset=krea2_ostris_edit".
+//                     NULL/"" = version default preset.
+// The embeddings written to cond/uncond_out_path are self-contained: the VLM
+// image embeddings are merged inside the LLM graph, so Phase 2 needs nothing
+// extra. Peak VRAM ~= LLM + vision tower while encoding.
+SD_API bool sd_encode_image_prompt_v3(const char* llm_path,
+                                      const char* llm_vision_path,
+                                      const char* prompt,
+                                      const char* negative_prompt,
+                                      const sd_image_t* ref_images,
+                                      int ref_images_count,
+                                      const char* ref_image_args,
+                                      int n_threads,
+                                      const char* cond_out_path,
+                                      const char* uncond_out_path,
+                                      int encoder_type);
 
 // Phase 2: Tell a generation context to use precomputed embeddings produced by
 // sd_encode_video_prompt()/sd_encode_ltxav_prompt(). After this call,

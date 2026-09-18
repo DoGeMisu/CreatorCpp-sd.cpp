@@ -1,4 +1,4 @@
-#include <algorithm>
+﻿#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <set>
@@ -863,7 +863,7 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
             }
         }
 
-        // ip_adapter_path removed for ABI compat �?always disabled
+        // ip_adapter_path removed for ABI compat �?always disabled
 
         model_loader.convert_tensors_name();
 
@@ -982,7 +982,7 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
             }
         }
 
-        // rpc_servers removed from sd_ctx_params_t for ABI compat �?no RPC devices
+        // rpc_servers removed from sd_ctx_params_t for ABI compat �?no RPC devices
 
         bool use_tae         = false;
         // Audio VAE path: read from SD_AUDIO_VAE_PATH env (zero ABI change).
@@ -1018,6 +1018,22 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
         model_manager->set_enable_mmap(enable_mmap);
         ModelLoader& model_loader = model_manager->loader();
 
+        // encode-only / decode-only: pre-set the loader version BEFORE files are
+        // loaded so convert_tensors_name() (called inside init_model_loader) uses
+        // the forced architecture. E.g. the Krea2 vision-tower tensor names
+        // ("model.visual.*" -> "text_encoders.llm.visual.*") only convert under
+        // sd_version_is_krea2(), which the TE file itself cannot be detected as.
+        if (encode_only_mode) {
+            switch (encode_encoder_type) {
+                case 1:    model_loader.set_version(VERSION_WAN2);          break;
+                case 2:    model_loader.set_version(VERSION_HUNYUAN_VIDEO); break;
+                case 3:    model_loader.set_version(VERSION_MINIMAX_H3);    break;
+                case 100:  model_loader.set_version(VERSION_Z_IMAGE);       break;
+                case 200:  model_loader.set_version(VERSION_KREA2);         break;
+                default:   model_loader.set_version(VERSION_LTXAV);         break;
+            }
+        }
+
         if (!init_model_loader(model_loader, sd_ctx_params, use_tae, use_audio_vae, use_control_net)) {
             return false;
         }
@@ -1026,10 +1042,12 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
         if (encode_only_mode) {
             // Force the version to match the requested encoder architecture.
             switch (encode_encoder_type) {
-                case 1: version = VERSION_WAN2;          break;  // Wan2.x (T5 XXL)
-                case 2: version = VERSION_HUNYUAN_VIDEO; break;  // HunyuanVideo (MLLM)
-                case 3: version = VERSION_MINIMAX_H3;    break;  // MiniMax-H3 (LLM)
-                default: version = VERSION_LTXAV;        break;  // LTX-2.3 (Gemma LLM)
+                case 1:    version = VERSION_WAN2;          break;  // Wan2.x (T5 XXL)
+                case 2:    version = VERSION_HUNYUAN_VIDEO; break;  // HunyuanVideo (MLLM)
+                case 3:    version = VERSION_MINIMAX_H3;    break;  // MiniMax-H3 (LLM)
+                case 100:  version = VERSION_Z_IMAGE;       break;  // Z-Image (Qwen3-4B LLM) - image two-phase
+                case 200:  version = VERSION_KREA2;        break;  // Krea2 (Qwen3-VL-4B LLM) - image two-phase
+                default:   version = VERSION_LTXAV;        break;  // LTX-2.3 (Gemma LLM)
             }
             LOG_INFO("encode-only mode: version forced to %s (encoder type %d)",
                      model_version_to_str[version], encode_encoder_type);
@@ -1259,16 +1277,34 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                                                                                "model.diffusion_model",
                                                                                model_manager);
             } else if (sd_version_is_krea2(version)) {
-                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
-                                                                 tensor_storage_map,
-                                                                 version,
-                                                                 "",
-                                                                 true,
-                                                                 model_manager);
-                diffusion_model  = std::make_shared<Krea2::Krea2Runner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                       tensor_storage_map,
-                                                                       "model.diffusion_model",
-                                                                       model_manager);
+                // 两阶段模式: diffusion-only ctx（无 TE tensors）时跳过 cond_stage_model（省 ~2GB VRAM 预分配）；
+                // TE 由 sd_encode_image_prompt_v2(encoder_type=200) 单独加载编码。
+                bool krea2_has_llm = false;
+                for (const auto& [name, _] : tensor_storage_map) {
+                    if (name.rfind("text_encoders.llm.", 0) == 0) {
+                        krea2_has_llm = true;
+                        break;
+                    }
+                }
+                if (krea2_has_llm) {
+                    cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                     tensor_storage_map,
+                                                                     version,
+                                                                     "",
+                                                                     true,
+                                                                     model_manager);
+                } else {
+                    LOG_INFO("Krea2: no text_encoders.llm tensors found; text encoder skipped "
+                             "(two-phase mode: use sd_encode_image_prompt_v2 + sd_ctx_set_precomputed_embeddings)");
+                }
+                if (!encode_only_mode) {
+                    // encode-only ctx（Phase 1 TE 编码）不构造 diffusion model：
+                    // 无 DiT tensors 时 detect_from_weights 得到全零 config，构造会断言失败
+                    diffusion_model  = std::make_shared<Krea2::Krea2Runner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                           tensor_storage_map,
+                                                                           "model.diffusion_model",
+                                                                           model_manager);
+                }
             } else if (sd_version_is_flux(version)) {
                 bool is_chroma = false;
                 for (auto pair : tensor_storage_map) {
@@ -1490,17 +1526,34 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                                                                        "model.diffusion_model",
                                                                        model_manager);
             } else if (sd_version_is_z_image(version)) {
-                cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
-                                                                 tensor_storage_map,
-                                                                 version,
-                                                                 "",
-                                                                 false,
-                                                                 model_manager);
-                diffusion_model  = std::make_shared<ZImage::ZImageRunner>(backend_for(SDBackendModule::DIFFUSION),
-                                                                         tensor_storage_map,
-                                                                         "model.diffusion_model",
-                                                                         version,
-                                                                         model_manager);
+                // 两阶段模式: diffusion-only ctx（无 TE tensors）时跳过 cond_stage_model；
+                // encode-only ctx（TE 编码）时只建 cond_stage_model，不建 diffusion_model。
+                // 正常单文件模式（有 TE tensors）时两者都建。
+                bool has_llm_tensors = false;
+                for (const auto& [name, _] : tensor_storage_map) {
+                    if (name.rfind("text_encoders.llm.", 0) == 0) {
+                        has_llm_tensors = true;
+                        break;
+                    }
+                }
+                if (has_llm_tensors) {
+                    cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
+                                                                     tensor_storage_map,
+                                                                     version,
+                                                                     "",
+                                                                     false,
+                                                                     model_manager);
+                } else {
+                    LOG_INFO("Z-Image: no text_encoders.llm tensors found; text encoder skipped "
+                             "(two-phase mode: use sd_encode_image_prompt + sd_ctx_set_precomputed_embeddings)");
+                }
+                if (!encode_only_mode) {
+                    diffusion_model  = std::make_shared<ZImage::ZImageRunner>(backend_for(SDBackendModule::DIFFUSION),
+                                                                              tensor_storage_map,
+                                                                              "model.diffusion_model",
+                                                                              version,
+                                                                              model_manager);
+                }
             } else if (sd_version_is_boogu_image(version)) {
                 cond_stage_model = std::make_shared<LLMEmbedder>(backend_for(SDBackendModule::TE),
                                                                  tensor_storage_map,
@@ -2076,7 +2129,7 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
         // skip validation for conditioner (text_encoders.llm.) and VAE (first_stage_model.) tensors.
         // The LLMEmbedder and AutoEncoderKL still register param tensors, but they have no weights
         // to load from the file. They will be fed externally at generation time.
-        if (sd_version_is_z_image(version) || sd_version_is_boogu_image(version)) {
+        if (sd_version_is_z_image(version) || sd_version_is_boogu_image(version) || sd_version_is_krea2(version)) {
             // Check if the model file actually lacks text encoder and VAE
             const auto& ts_map = model_loader.get_tensor_storage_map();
             bool has_te = false, has_vae = false;
@@ -2270,7 +2323,7 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                         denoiser = std::make_shared<FluxFlowDenoiser>();
                     } else {
                         LOG_INFO("running in FLOW mode");
-                        denoiser = std::make_shared<DiscreteFlowDenoiser>();
+                        denoiser = std::make_shared<DiscreteFlowDenoiser>(default_flow_shift);
                     }
                     break;
                 }
@@ -2478,7 +2531,7 @@ if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0) {
                                               lora_tensor_filter);
             // Only attach the adapter when there are LoRAs targeting the cond_stage model.
             // An empty MultiLoraAdapter still routes every linear/conv through
-            // forward_with_lora() instead of the direct kernel path �?slower for no benefit.
+            // forward_with_lora() instead of the direct kernel path �?slower for no benefit.
             if (!cond_stage_lora_models.empty()) {
                 auto multi_lora_adapter = std::make_shared<MultiLoraAdapter>(cond_stage_lora_models);
                 cond_stage_model->set_weight_adapter(multi_lora_adapter);
@@ -5508,6 +5561,22 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         if (sd_ctx->sd->version == VERSION_HIDREAM_O1) {
             continue;
         }
+        // Per-image strength (optional, parallel to ref_images):
+        //   st <= 0 : skip the DiT latent entirely (the caller must also have
+        //             excluded this image from the Phase-1 VLM encode so the
+        //             token layout stays consistent)
+        //   0< st <1 : VLM sees the image normally; the DiT latent is linearly
+        //             scaled (engineering approximation)
+        //   st >= 1  : full strength
+        float ref_st = 1.0f;
+        if (sd_img_gen_params->ref_images_strength != nullptr &&
+            i < static_cast<size_t>(sd_img_gen_params->ref_images_count)) {
+            ref_st = sd_img_gen_params->ref_images_strength[i];
+        }
+        if (ref_st <= 0.0f) {
+            LOG_WARN("reference image %d: strength<=0, skipping its DiT latent", static_cast<int>(i));
+            continue;
+        }
         sd::Tensor<float> ref_latent;
         if (ref_image_params.resize_before_vae && !sd_version_is_pid(sd_ctx->sd->version)) {
             LOG_DEBUG("auto resize ref images");
@@ -5547,6 +5616,11 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
         if (ref_latent.empty()) {
             LOG_ERROR("failed to encode reference image %d", static_cast<int>(i));
             return std::nullopt;
+        }
+        if (ref_st < 1.0f) {
+            // Linear latent scaling (per-image strength, engineering approximation)
+            ref_latent *= ref_st;
+            LOG_INFO("reference image %d: latent scaled by strength %.2f", static_cast<int>(i), ref_st);
         }
 
         ref_latents.push_back(std::move(ref_latent));
@@ -5642,12 +5716,50 @@ static std::optional<ImageGenerationLatents> prepare_image_generation_latents(sd
     return latents;
 }
 
+// Forward declarations: embedding persistence helpers (defined in the
+// two-phase video section further below; reused by the image two-phase flow).
+static bool save_embedding_to_file(const std::string& path, const sd::Tensor<float>& tensor);
+static sd::Tensor<float> load_embedding_from_file(const std::string& path);
+
 static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_ctx_t* sd_ctx,
                                                                             const sd_img_gen_params_t* sd_img_gen_params,
                                                                             GenerationRequest* request,
                                                                             SamplePlan* plan,
                                                                             ImageGenerationLatents* latents,
                                                                             const RefImageParams& ref_image_params) {
+    // 两阶段模式: precomputed embeddings（TE 已由 sd_encode_image_prompt 单独编码并落盘）。
+    // diffusion-only ctx 无 cond_stage_model，直接从文件加载 cond/uncond embeddings。
+    if (sd_ctx->sd->cond_stage_model == nullptr &&
+        sd_ctx->sd->use_precomputed_embeddings &&
+        !sd_ctx->sd->precomputed_cond_embedding_path.empty()) {
+        int64_t t0 = ggml_time_ms();
+        ImageGenerationEmbeds embeds;
+        embeds.cond.c_crossattn = load_embedding_from_file(sd_ctx->sd->precomputed_cond_embedding_path);
+        if (embeds.cond.c_crossattn.empty()) {
+            LOG_ERROR("prepare_image_generation_embeds: failed to load precomputed cond embedding from '%s'",
+                      sd_ctx->sd->precomputed_cond_embedding_path.c_str());
+            return std::nullopt;
+        }
+        LOG_INFO("using precomputed cond embedding from '%s' (shape %s)",
+                 sd_ctx->sd->precomputed_cond_embedding_path.c_str(),
+                 sd::tensor_shape_to_string(embeds.cond.c_crossattn.shape()).c_str());
+        if ((request->use_uncond || request->use_high_noise_uncond) &&
+            !sd_ctx->sd->precomputed_uncond_embedding_path.empty()) {
+            embeds.uncond.c_crossattn = load_embedding_from_file(sd_ctx->sd->precomputed_uncond_embedding_path);
+            if (embeds.uncond.c_crossattn.empty()) {
+                LOG_ERROR("prepare_image_generation_embeds: failed to load precomputed uncond embedding from '%s'",
+                          sd_ctx->sd->precomputed_uncond_embedding_path.c_str());
+                return std::nullopt;
+            }
+            LOG_INFO("using precomputed uncond embedding from '%s' (shape %s)",
+                     sd_ctx->sd->precomputed_uncond_embedding_path.c_str(),
+                     sd::tensor_shape_to_string(embeds.uncond.c_crossattn.shape()).c_str());
+        }
+        int64_t t1 = ggml_time_ms();
+        LOG_INFO("precomputed embeddings loaded, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+        return embeds;
+    }
+
     ConditionerRunnerDoneOnExit conditioner_runner_done{sd_ctx->sd->cond_stage_model.get()};
 
     ConditionerParams condition_params;
@@ -8012,13 +8124,229 @@ SD_API bool sd_encode_ltxav_prompt(const char* llm_path,
                                    const char* uncond_out_path) {
     // Convenience wrapper: LTX-2.3 encoder.
     return sd_encode_video_prompt(SD_VIDEO_ENCODER_LTX2,
-                                  llm_path,
-                                  embeddings_connectors_path,
-                                  prompt,
-                                  negative_prompt,
-                                  n_threads,
-                                  cond_out_path,
-                                  uncond_out_path);
+                                   llm_path,
+                                   embeddings_connectors_path,
+                                   prompt,
+                                   negative_prompt,
+                                   n_threads,
+                                   cond_out_path,
+                                   uncond_out_path);
+}
+
+// ===========================================================================
+// Two-phase image generation (Z-Image): Phase 1 (TE encode)
+//
+// Loads a Qwen3 text encoder (GGUF or safetensors) into a temporary
+// encode-only context, encodes the prompt / negative prompt, persists the
+// embeddings to disk, then releases the context.  The main diffusion ctx is
+// created separately (without llm_path) and fed via
+// sd_ctx_set_precomputed_embeddings() — keeping the 8GB-VRAM footprint of
+// each stage independent (TE ~2.5GB while encoding, DiT ~3GB while sampling).
+// ===========================================================================
+static bool sd_encode_image_prompt_impl(const char* llm_path,
+                                        const char* llm_vision_path,
+                                        const char* prompt,
+                                        const char* negative_prompt,
+                                        const sd_image_t* ref_images,
+                                        int ref_images_count,
+                                        const char* ref_image_args,
+                                        int n_threads,
+                                        const char* cond_out_path,
+                                        const char* uncond_out_path,
+                                        int encoder_type) {
+    // CRITICAL: ggml_time_ms() divides by timer_freq which is 0 until ggml_time_init()
+    // is called. On cold start (no prior ggml call), this causes 0xC0000094 (integer div-by-zero).
+#ifdef _WIN32
+    ggml_time_init();
+#endif
+    LOG_INFO("sd_encode_image_prompt: enter, llm_path=%s, vision_path=%s, ref_images=%d, args=%s",
+             llm_path ? llm_path : "(null)",
+             (llm_vision_path != nullptr && strlen(llm_vision_path) > 0) ? llm_vision_path : "(none)",
+             ref_images_count,
+             (ref_image_args != nullptr && strlen(ref_image_args) > 0) ? ref_image_args : "(default)");
+    if (llm_path == nullptr || strlen(llm_path) == 0 || prompt == nullptr || cond_out_path == nullptr) {
+        LOG_ERROR("sd_encode_image_prompt: invalid arguments (llm_path, prompt, cond_out_path are required)");
+        return false;
+    }
+
+    int64_t t0 = ggml_time_ms();
+    LOG_INFO("[Image Phase 1] Text Encoder begin — load, encode, sync, release");
+
+    // ---- Create an encode-only context (LLM text encoder, optionally + vision tower) ----
+    sd_ctx_t* sd_ctx = (sd_ctx_t*)malloc(sizeof(sd_ctx_t));
+    if (sd_ctx == nullptr) {
+        LOG_ERROR("sd_encode_image_prompt: out of memory");
+        return false;
+    }
+    sd_ctx->sd = new StableDiffusionGGML();
+    if (sd_ctx->sd == nullptr) {
+        free(sd_ctx);
+        return false;
+    }
+    sd_ctx->sd->encode_only_mode    = true;
+    sd_ctx->sd->encode_encoder_type = encoder_type;
+
+    // Clear a stale SD_PARAMS_BACKEND from a previous phase so the encoder
+    // context gets a clean auto-fit backend assignment.
+    {
+#ifdef _WIN32
+        SetEnvironmentVariableA("SD_PARAMS_BACKEND", "");
+#else
+        setenv("SD_PARAMS_BACKEND", "", 1);
+#endif
+    }
+
+    sd_ctx_params_t params;
+    sd_ctx_params_init(&params);
+    params.n_threads  = n_threads;
+    params.max_vram   = -1;   // auto-detect free VRAM; TE weights land on GPU when they fit
+    // Reference images make the VLM prompt sequence long (1000+ tokens):
+    // flash attention pays off there. Text-only prompts stay short — keep FA off.
+    params.flash_attn = ref_images_count > 0;
+    params.llm_path   = llm_path;
+    if (llm_vision_path != nullptr && strlen(llm_vision_path) > 0) {
+        params.llm_vision_path = llm_vision_path;
+        LOG_INFO("sd_encode_image_prompt: vision tower from %s", llm_vision_path);
+    }
+
+    if (!sd_ctx->sd->init(&params)) {
+        delete sd_ctx->sd;
+        sd_ctx->sd = nullptr;
+        free(sd_ctx);
+        LOG_ERROR("sd_encode_image_prompt: failed to create text-encoder context");
+        return false;
+    }
+    if (sd_ctx->sd->cond_stage_model == nullptr) {
+        LOG_ERROR("sd_encode_image_prompt: cond_stage_model is null (is the TE a Qwen3 model?)");
+        free_sd_ctx(sd_ctx);
+        return false;
+    }
+
+    // ---- Reference images: convert to tensors for the VLM branch ----
+    // NOTE: the caller must already have filtered out strength<=0 images so the
+    // VLM token layout stays consistent with the Phase-2 DiT ref latents.
+    std::vector<sd::Tensor<float>> ref_tensors;
+    RefImageParams ref_image_params = sd_ctx->sd->resolve_ref_image_params(
+        (ref_image_args != nullptr && strlen(ref_image_args) > 0) ? ref_image_args : "");
+    if (ref_images != nullptr && ref_images_count > 0) {
+        for (int i = 0; i < ref_images_count; i++) {
+            if (ref_images[i].data == nullptr) {
+                LOG_WARN("sd_encode_image_prompt: ref image %d has no data, skipping", i);
+                continue;
+            }
+            ref_tensors.push_back(ensure_image_tensor_channels(sd_image_to_tensor(ref_images[i]),
+                                                               3));
+        }
+        LOG_INFO("sd_encode_image_prompt: %d reference image(s) prepared for the VLM branch",
+                 static_cast<int>(ref_tensors.size()));
+    }
+
+    bool ok = true;
+
+    // ---- Encode positive prompt (with reference images when present) ----
+    {
+        ConditionerParams cond_params;
+        cond_params.text = prompt;
+        if (!ref_tensors.empty()) {
+            cond_params.ref_image_params = ref_image_params;
+            if (ref_image_params.pass_to_vlm) {
+                cond_params.ref_images = &ref_tensors;
+            }
+        }
+        SDCondition cond = sd_ctx->sd->cond_stage_model->get_learned_condition(n_threads, cond_params);
+        if (cond.c_crossattn.empty()) {
+            LOG_ERROR("sd_encode_image_prompt: encoding cond prompt failed");
+            ok = false;
+        } else if (!save_embedding_to_file(cond_out_path, cond.c_crossattn)) {
+            LOG_ERROR("sd_encode_image_prompt: failed to save cond embedding to %s", cond_out_path);
+            ok = false;
+        } else {
+            LOG_INFO("sd_encode_image_prompt: cond embedding saved to %s (shape %s, %.2f MB)",
+                     cond_out_path,
+                     sd::tensor_shape_to_string(cond.c_crossattn.shape()).c_str(),
+                     cond.c_crossattn.numel() * sizeof(float) / 1024.0 / 1024.0);
+        }
+    }
+
+    // ---- Encode negative prompt (optional; same ref layout as cond) ----
+    if (ok && negative_prompt != nullptr && uncond_out_path != nullptr && strlen(uncond_out_path) > 0) {
+        ConditionerParams uncond_params;
+        uncond_params.text = negative_prompt;
+        if (!ref_tensors.empty()) {
+            uncond_params.ref_image_params = ref_image_params;
+            if (ref_image_params.pass_to_vlm) {
+                uncond_params.ref_images = &ref_tensors;
+            }
+        }
+        SDCondition uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(n_threads, uncond_params);
+        if (uncond.c_crossattn.empty()) {
+            LOG_ERROR("sd_encode_image_prompt: encoding uncond prompt failed");
+            ok = false;
+        } else if (!save_embedding_to_file(uncond_out_path, uncond.c_crossattn)) {
+            LOG_ERROR("sd_encode_image_prompt: failed to save uncond embedding to %s", uncond_out_path);
+            ok = false;
+        } else {
+            LOG_INFO("sd_encode_image_prompt: uncond embedding saved to %s (shape %s)",
+                     uncond_out_path,
+                     sd::tensor_shape_to_string(uncond.c_crossattn.shape()).c_str());
+        }
+    }
+
+    // Release the text-encoder context (frees all encoder memory).
+    sd_ctx->sd->cond_stage_model->runner_done();
+    // CUDA sync: ensure all pending GPU operations complete before freeing.
+    {
+        ggml_backend_t te_backend = sd_ctx->sd->backend_manager.runtime_backend(SDBackendModule::TE);
+        if (te_backend != nullptr && !sd_backend_is_cpu(te_backend)) {
+            LOG_INFO("sd_encode_image_prompt: synchronizing TE backend before context release");
+            ggml_backend_synchronize(te_backend);
+        }
+    }
+    free_sd_ctx(sd_ctx);
+
+    int64_t t1 = ggml_time_ms();
+    LOG_INFO("[Image Phase 1] Text Encoder end — context released, embeddings persisted to disk");
+    LOG_INFO("sd_encode_image_prompt completed, taking %.2fs", (t1 - t0) * 1.0f / 1000);
+    return ok;
+}
+
+SD_API bool sd_encode_image_prompt_v3(const char* llm_path,
+                                      const char* llm_vision_path,
+                                      const char* prompt,
+                                      const char* negative_prompt,
+                                      const sd_image_t* ref_images,
+                                      int ref_images_count,
+                                      const char* ref_image_args,
+                                      int n_threads,
+                                      const char* cond_out_path,
+                                      const char* uncond_out_path,
+                                      int encoder_type) {
+    return sd_encode_image_prompt_impl(llm_path, llm_vision_path, prompt, negative_prompt,
+                                       ref_images, ref_images_count, ref_image_args, n_threads,
+                                       cond_out_path, uncond_out_path, encoder_type);
+}
+
+SD_API bool sd_encode_image_prompt_v2(const char* llm_path,
+                                      const char* prompt,
+                                      const char* negative_prompt,
+                                      int n_threads,
+                                      const char* cond_out_path,
+                                      const char* uncond_out_path,
+                                      int encoder_type) {
+    return sd_encode_image_prompt_impl(llm_path, nullptr, prompt, negative_prompt,
+                                       nullptr, 0, nullptr, n_threads,
+                                       cond_out_path, uncond_out_path, encoder_type);
+}
+
+SD_API bool sd_encode_image_prompt(const char* llm_path,
+                                   const char* prompt,
+                                   const char* negative_prompt,
+                                   int n_threads,
+                                   const char* cond_out_path,
+                                   const char* uncond_out_path) {
+    return sd_encode_image_prompt_impl(llm_path, nullptr, prompt, negative_prompt,
+                                       nullptr, 0, nullptr, n_threads,
+                                       cond_out_path, uncond_out_path, 100);  // Z-Image
 }
 
 SD_API bool sd_ctx_set_precomputed_embeddings(sd_ctx_t* sd_ctx,

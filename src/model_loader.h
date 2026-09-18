@@ -54,6 +54,10 @@ public:
 
     bool init_from_file(const std::string& file_path, const std::string& prefix = "");
     void convert_tensors_name();
+    // Pre-set the version used by convert_tensors_name() (encode-only contexts
+    // force the version AFTER files are loaded, but name conversion happens
+    // during loading — e.g. Krea2 vision-tower names need the forced version).
+    void set_version(SDVersion version) { version_ = version; }
     bool init_from_file_and_convert_name(const std::string& file_path,
                                          const std::string& prefix = "",
                                          SDVersion version         = VERSION_COUNT);
